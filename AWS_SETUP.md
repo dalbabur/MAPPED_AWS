@@ -198,7 +198,12 @@ aws iam attach-role-policy --role-name MappedSpotFleetRole \
 ### 3.5 Head/orchestrator node instance role
 
 The EC2 instance that runs `run_MAPPED.sh`/Nextflow itself needs to submit and monitor
-Batch jobs and read/write the same S3 bucket.
+Batch jobs and read/write the same S3 bucket. Include the `batch:TagResource`/
+`UntagResource`/`ListTagsForResource` actions below even though they look unrelated to
+"submitting jobs" — Nextflow's `awsbatch` executor dynamically registers a job definition
+per process/container combo the first time it's needed, and tags it, so `TagResource`
+denied here surfaces as an opaque `Error executing process` failure on the *first* job
+Nextflow ever submits, not as an obviously-IAM-shaped error.
 
 ```bash
 aws iam create-role --role-name MappedHeadNodeRole \
@@ -222,7 +227,8 @@ cat > mapped-head-node-policy.json <<'EOF'
       "Action": [
         "batch:SubmitJob", "batch:DescribeJobs", "batch:ListJobs", "batch:TerminateJob",
         "batch:DescribeJobQueues", "batch:DescribeComputeEnvironments", "batch:DescribeJobDefinitions",
-        "batch:RegisterJobDefinition", "batch:DeregisterJobDefinition"
+        "batch:RegisterJobDefinition", "batch:DeregisterJobDefinition",
+        "batch:TagResource", "batch:UntagResource", "batch:ListTagsForResource"
       ],
       "Resource": "*"
     },
