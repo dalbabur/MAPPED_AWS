@@ -705,11 +705,17 @@ aws ec2 describe-instance-types --filters Name=free-tier-eligible,Values=true \
 
 An empty result (or an error) means no restriction — `"optimal"` is fine as-is. A
 non-empty list means you're restricted to exactly those types; use that list for
-`instanceTypes` instead of `"optimal"` (exclude any `t4g.*`/ARM entries unless you're
-also using an ARM AMI/launch template, which this guide's §6 isn't). On the account this
-was validated against, that list was `t3.micro, t3.small, c7i-flex.large, m7i-flex.large`
-— all capping out at 2 vCPU / 8 GiB, which is why `aws.config`'s per-process `cpus`/
-`memory` directives are capped at 2 vCPU with a comment explaining why; raise them back
+`instanceTypes` instead of `"optimal"`, with two exclusions: any `t4g.*`/ARM entries
+(unless you're also using an ARM AMI/launch template, which this guide's §6 isn't), and
+**any `t2.*`/`t3.*`/`t3a.*`/`t4g.*` burstable-performance family at all** — AWS Batch's
+managed compute environments don't support the T family as an `instanceTypes` value
+regardless of Free Tier eligibility (`create-compute-environment` rejects it with a
+`ClientException` enumerating the entire set of instance types Batch *does* accept, which
+notably contains no `t3.*`/`t2.*` entries anywhere). On the account this was validated
+against, the Free Tier list included `t3.micro`/`t3.small`, but those had to be dropped
+for this reason, leaving only `c7i-flex.large, m7i-flex.large` — both capping out at
+2 vCPU / 8 GiB, which is why `aws.config`'s per-process `cpus`/`memory` directives are
+capped at 2 vCPU with a comment explaining why; raise them back
 up (and broaden `instanceTypes`) if your account has no such restriction.
 
 `aws.config`'s `process.queue` must match the queue name (`mapped-spot-queue`, or pass
