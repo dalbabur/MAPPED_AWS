@@ -103,26 +103,49 @@ Four distinct roles. Don't collapse them into one broad role — the point of sp
 them is that a compromised or buggy pipeline job can only touch the pipeline's own
 bucket prefix, not your whole account.
 
-**Check for the account-wide Spot Fleet service-linked role first** — this is separate
-from all four roles below (those are specific to this pipeline's resources; this one is
-a foundational, account-wide role that AWS's Spot Fleet infrastructure itself depends
-on). AWS normally auto-creates it the first time *anything* in the account ever
-successfully uses Spot Fleet, but if this account never has, it won't exist yet — and
-its absence causes an extremely confusing, silent failure mode: the compute environment
-reports `VALID`/`Healthy`, correctly computes non-zero `desiredvCpus` in response to a
-submitted job, but never actually issues a Spot Fleet request or launches any EC2
-instance — no error anywhere, the job just sits `RUNNABLE` forever. This looks
-identical to a stuck/cached compute-environment state (and deleting/recreating the
-compute environment under a new name will *not* fix it, since the missing role is
-account-wide, not tied to any specific compute environment). Check and create it before
-troubleshooting anything else if you see a job stuck `RUNNABLE` with `desiredvCpus > 0`
-but no Spot Fleet requests in `aws ec2 describe-spot-fleet-requests`:
+**If a job ever sits `RUNNABLE` with `desiredvCpus > 0` and no EC2 instance shows up**,
+read this before anything else. `describe-compute-environments` and `describe-jobs` will
+both keep insisting everything is `VALID`/`Healthy` — AWS Batch does not surface the real
+error through either of those. The one place it does show up is the Auto Scaling Group
+that an EC2-type compute environment creates internally:
 
 ```bash
-aws iam get-role --role-name AWSServiceRoleForEC2SpotFleet
-# NoSuchEntity means it's missing -- create it:
-aws iam create-service-linked-role --aws-service-name spotfleet.amazonaws.com
+# Find the ASG (name embeds your compute environment's name):
+aws autoscaling describe-auto-scaling-groups \
+  --query "AutoScalingGroups[?contains(AutoScalingGroupName, '<your-ce-name>')].AutoScalingGroupName" \
+  --output text
+
+# Read what it's actually failing on:
+aws autoscaling describe-scaling-activities --auto-scaling-group-name <name-from-above> \
+  --query 'Activities[?StatusCode==`Failed`].StatusMessage' --output text
 ```
+
+Two account-wide causes hit while validating this against a live account, both worth
+ruling out before digging further into whatever the ASG log actually says:
+
+1. **Missing account-wide service-linked roles.** These are foundational roles AWS
+   auto-creates the first time *anything* in the account successfully uses the
+   corresponding service — if this account never has, they won't exist, and their
+   absence doesn't error, it just silently prevents capacity from ever launching. Two
+   were missing here: `AWSServiceRoleForBatch` (Batch's own service-linked role — *not*
+   the same as the pipeline-specific `MappedBatchServiceRole` in §3.1 below) and
+   `AWSServiceRoleForEC2SpotFleet` (needed specifically for `SPOT`-type compute
+   environments). Both are account-wide, not tied to any specific compute environment —
+   deleting/recreating the compute environment under a new name will *not* fix a missing
+   role. Check and create either:
+   ```bash
+   aws iam get-role --role-name AWSServiceRoleForBatch
+   aws iam create-service-linked-role --aws-service-name batch.amazonaws.com
+   aws iam get-role --role-name AWSServiceRoleForEC2SpotFleet
+   aws iam create-service-linked-role --aws-service-name spotfleet.amazonaws.com
+   ```
+2. **Free Tier instance-type restriction** (see §8) — the ASG log's actual failure
+   message on this account was `InvalidParameterCombination - The specified instance
+   type is not eligible for Free Tier`, from `instanceTypes: ["optimal"]` resolving to
+   large current-generation instances (e.g. `r6i.16xlarge`) this account isn't allowed to
+   launch. This was the account's *actual* root cause here — the missing service-linked
+   roles above were real gaps worth fixing regardless, but fixing them alone didn't
+   unblock capacity; the ASG log is what finally showed the real reason.
 
 ### 3.1 AWS Batch service role
 
@@ -667,6 +690,27 @@ running — Batch launches Spot instances on demand when jobs are submitted, and
 terminates them when the queue empties. `"instanceTypes": ["optimal"]` lets Batch pick
 from the current-generation C/M/R families; you can narrow this if you have a strong
 preference, but "optimal" generally gets the best Spot availability.
+
+**Check this account's Free Tier instance-type restriction before trusting `"optimal"`**
+— some accounts (this one included) reject every non-Free-Tier-eligible instance type at
+the EC2 API level, and `"optimal"`'s C/M/R family pool doesn't include any Free-Tier-
+eligible types. The compute environment will report `VALID`/`Healthy` regardless and the
+job will simply sit `RUNNABLE` forever with no visible error (see the troubleshooting
+note in §3) — this doesn't fail loudly, so check up front:
+
+```bash
+aws ec2 describe-instance-types --filters Name=free-tier-eligible,Values=true \
+  --query 'InstanceTypes[].InstanceType' --output text
+```
+
+An empty result (or an error) means no restriction — `"optimal"` is fine as-is. A
+non-empty list means you're restricted to exactly those types; use that list for
+`instanceTypes` instead of `"optimal"` (exclude any `t4g.*`/ARM entries unless you're
+also using an ARM AMI/launch template, which this guide's §6 isn't). On the account this
+was validated against, that list was `t3.micro, t3.small, c7i-flex.large, m7i-flex.large`
+— all capping out at 2 vCPU / 8 GiB, which is why `aws.config`'s per-process `cpus`/
+`memory` directives are capped at 2 vCPU with a comment explaining why; raise them back
+up (and broaden `instanceTypes`) if your account has no such restriction.
 
 `aws.config`'s `process.queue` must match the queue name (`mapped-spot-queue`, or pass
 `--aws_batch_queue <name>` at runtime to override).
