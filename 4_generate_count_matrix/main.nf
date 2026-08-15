@@ -68,7 +68,11 @@ process FASTQC {
     // invoked. params.cpu is already fully resolved by the time processes are defined, so
     // a plain expression (evaluated once, like sibling modules' `maxForks params.x ?: y`)
     // works fine and needs no per-task re-evaluation anyway.
-    maxForks( (params.cpu / 4) as Integer )
+    // Also needs an explicit `as Integer` cast on params.cpu itself: CLI-supplied params
+    // (--cpu 8) arrive as Strings, and Groovy Strings don't support `/` -- fails with
+    // "Unknown method invocation `div` on String type" the moment this is evaluated
+    // eagerly (masked before by the closure never actually being invoked).
+    maxForks( (params.cpu as Integer).intdiv(4) )
     errorStrategy 'ignore'
 
     input:
@@ -106,7 +110,7 @@ process TRIMGALORE {
     container 'quay.io/biocontainers/trim-galore:0.6.9--hdfd78af_0'
     publishDir "${params.outdir}/trimmed", mode: 'copy'
     cpus 4
-    maxForks( (params.cpu / 4) as Integer )
+    maxForks( (params.cpu as Integer).intdiv(4) )
     errorStrategy 'ignore'
 
     input:
@@ -147,7 +151,7 @@ process SALMON_QUANT {
     container 'quay.io/biocontainers/salmon:1.10.3--h45fbf2d_4'
     publishDir "${params.outdir}/salmon", mode: 'copy'
     cpus 4
-    maxForks( (params.cpu / 4) as Integer )
+    maxForks( (params.cpu as Integer).intdiv(4) )
     errorStrategy 'ignore'
 
     input:
