@@ -219,10 +219,31 @@ public, anonymous-access bucket.
 
 Point Nextflow at this role by passing `--aws_batch_job_role_arn` (wired up in
 `aws.config`'s `aws.batch` block); otherwise jobs fall back to the compute environment's
-broader instance role (§3.2):
+broader instance role (§3.2). **Recommended, not just optional** — the instance role is
+scoped for the EC2 host itself (SSM, ECR, tagging, etc.), not S3 object access, so relying
+on the fallback typically surfaces later as `AccessDenied`/403 on the job's first S3
+write:
 
 ```bash
 ./run_MAPPED.sh ... --aws_batch_job_role_arn "arn:aws:iam::$ACCOUNT_ID:role/MappedBatchJobRole"
+```
+
+**Whenever you pass `--aws_batch_job_role_arn`, the *head node's* role also needs
+`iam:PassRole` on that job role** — not just the job role needing to exist. AWS Batch
+requires the identity that calls `SubmitJob` (here, the head node's `MappedHeadNodeRole`,
+via Nextflow) to explicitly be allowed to pass the role it's asking jobs to assume; this
+is a standard anti-privilege-escalation control, not specific to this account. Omitting it
+surfaces as `iam:PassRole` `AccessDenied` on the very first job submission, *after*
+everything else (compute environment, queue, containers) is already working — easy to
+mistake for yet another compute environment problem. Add it to §3.5's policy:
+
+```bash
+aws iam put-role-policy --role-name MappedHeadNodeRole \
+  --policy-name MappedPassBatchJobRole --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{ "Effect": "Allow", "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::'"$ACCOUNT_ID"':role/MappedBatchJobRole" }]
+  }'
 ```
 
 ### 3.4 Spot Fleet role
@@ -518,6 +539,29 @@ the failure entirely, so `unzip` silently never got installed either, and the sc
 carried on to fail identically two steps later at `unzip`). Install *only* `unzip` —
 `curl-minimal` is already there and already works:
 
+**The official AWS CLI v2 zip installer's binary dynamically links against the host's
+system `libz.so.1` — it does not bundle its own copy.** This is invisible as long as you
+only ever run `aws` directly on the host (AL2023 ships `libz` at the OS level, so
+`/usr/local/aws-cli/bin/aws --version` works fine there), but every job container gets
+`/usr/local/aws-cli` bind-mounted in read-only at launch, and *not every biocontainer
+image ships `libz.so.1`* — many of the minimal `quay.io/biocontainers/*` images used by
+this pipeline's process modules don't. The job fails immediately with
+`error while loading shared libraries: libz.so.1: cannot open shared object file: No such
+file or directory` and exit code 127, even though the exact same binary works perfectly
+when invoked directly on the host or from a more fully-featured container. This is easy
+to misdiagnose as *another* instance of the `cliPath`/mount-layout bug above, since the
+symptom (job fails at the first `aws`-dependent command) looks identical — the difference
+is in the actual error text, which you'll only see by pulling the job's CloudWatch log
+(`aws batch describe-jobs` for the job's `logStreamName`, then `aws logs get-log-events`
+against log group `/aws/batch/job`); Nextflow's own log only shows a generic "container
+exited"/exit code 127.
+
+The fix: copy the host's `libz.so.1` into the same directory as the AWS CLI's real
+binary. The installer's `bin/aws` is a chain of symlinks that ultimately resolves to
+`v2/<version>/dist/aws` — the PyInstaller-bundled binary uses an `$ORIGIN`-relative rpath,
+so any shared library dropped in that same `dist/` directory is picked up automatically,
+no `LD_LIBRARY_PATH` or other config changes needed:
+
 ```bash
 cat > mapped-userdata.sh <<'EOF'
 Content-Type: multipart/mixed; boundary="===============MAPPEDBOUNDARY=="
@@ -539,6 +583,8 @@ unzip -o -q awscliv2.zip
 ./aws/install
 mkdir -p /usr/local/aws-cli/bin
 ln -sf /usr/local/aws-cli/v2/current/bin/aws /usr/local/aws-cli/bin/aws
+AWS_DIST_DIR=$(dirname $(readlink -f /usr/local/aws-cli/bin/aws))
+cp -n /usr/lib64/libz.so.1 "$AWS_DIST_DIR/" || true
 /usr/local/aws-cli/bin/aws --version
 
 --===============MAPPEDBOUNDARY==--
