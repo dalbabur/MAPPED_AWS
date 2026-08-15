@@ -42,6 +42,13 @@ every `nextflow run` invocation.
 - You need an AWS account with billing enabled and permission to create IAM roles, VPC
   resources, S3 buckets, and AWS Batch resources (typically `AdministratorAccess` for
   initial setup, scoped down afterward if desired).
+- **Two different machines show up in this guide, don't conflate them.** Sections 2-8
+  (account setup, IAM, VPC, S3, Launch Template, image build/push, Batch compute
+  environment/queue) are one-time infrastructure provisioning — run those commands from
+  wherever you normally run privileged `aws` CLI commands (typically your own laptop,
+  with the AWS CLI installed and an admin-level profile configured). Section 9 creates a
+  separate, unprivileged **head node** — that one's for actually running the pipeline
+  (`run_MAPPED.sh`/Nextflow) day-to-day, not for provisioning.
 
 ---
 
@@ -193,6 +200,11 @@ cat > mapped-head-node-policy.json <<'EOF'
 EOF
 aws iam put-role-policy --role-name MappedHeadNodeRole \
   --policy-name MappedHeadNodeAccess --policy-document file://mapped-head-node-policy.json
+
+# Required for Session Manager (§9) to connect without opening SSH inbound.
+aws iam attach-role-policy --role-name MappedHeadNodeRole \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
 aws iam create-instance-profile --instance-profile-name MappedHeadNodeProfile
 aws iam add-role-to-instance-profile \
   --instance-profile-name MappedHeadNodeProfile --role-name MappedHeadNodeRole
@@ -202,36 +214,94 @@ aws iam add-role-to-instance-profile \
 
 ## 4. VPC & networking
 
-You can reuse an existing VPC, or create a small dedicated one. Either way you need at
-least one subnet with outbound internet access (for pulling images from quay.io/Docker
-Hub and reaching NCBI/ENA for metadata) plus the following endpoints to keep the bulk of
-the pipeline's own traffic off the NAT Gateway (S3 traffic — SRA ODP reads, S3
-work/outdir staging — is usually the largest volume by far):
+### 4.1 Simplest path: use your account's default VPC (recommended to start)
+
+Almost every AWS account already has a **default VPC** per region, with public subnets
+(one per Availability Zone) that already route to an Internet Gateway — no NAT Gateway
+needed, which is the main thing that complicates this section otherwise. Check for one:
 
 ```bash
-VPC_ID=<your-vpc-id>
-ROUTE_TABLE_ID=<your-route-table-id>
+aws ec2 describe-vpcs --filters Name=is-default,Values=true \
+  --query 'Vpcs[0].VpcId' --output text
+```
 
-# S3 Gateway endpoint — free, covers both the SRA ODP buckets and your own bucket
+If that prints a real VPC ID (not `None`), you already have one — skip to getting its
+subnets below. If it prints `None`, create one (works on most accounts; if it errors,
+your account/region has no default VPC allowance — create a minimal custom VPC instead
+via `aws ec2 create-vpc` + `create-subnet` + `create-internet-gateway` +
+`attach-internet-gateway` + a route table entry for `0.0.0.0/0`, or ask an account admin):
+
+```bash
+aws ec2 create-default-vpc
+```
+
+Then capture the VPC, its public subnets, and a security group as shell variables —
+these are reused in §8 (compute environment) and §9 (head node):
+
+```bash
+VPC_ID=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true \
+  --query 'Vpcs[0].VpcId' --output text)
+
+SUBNET_IDS_JSON=$(aws ec2 describe-subnets --filters Name=vpc-id,Values="$VPC_ID" \
+  --query 'Subnets[].SubnetId' --output json)
+SUBNET_ID=$(aws ec2 describe-subnets --filters Name=vpc-id,Values="$VPC_ID" \
+  --query 'Subnets[0].SubnetId' --output text)
+echo "All subnets (for the Batch compute environment, §8): $SUBNET_IDS_JSON"
+echo "First subnet (for single-instance resources like the head node, §9): $SUBNET_ID"
+
+SG_ID=$(aws ec2 create-security-group --group-name mapped-sg \
+  --description "MAPPED pipeline (Batch + head node)" --vpc-id "$VPC_ID" \
+  --query GroupId --output text)
+```
+
+No inbound rules are needed on `$SG_ID` for the Batch compute environment (jobs only
+need outbound access, which the security group allows by default). For the head node,
+add inbound SSH only if you'll connect that way rather than via Session Manager (§9):
+
+```bash
+aws ec2 authorize-security-group-ingress --group-id "$SG_ID" \
+  --protocol tcp --port 22 --cidr "$(curl -s https://checkip.amazonaws.com)/32"
+```
+
+Optionally add the S3 Gateway endpoint — it's free, requires no subnet changes, and
+reduces both cost and latency for the pipeline's largest traffic source (SRA ODP reads
+plus your own S3 work/outdir staging):
+
+```bash
+ROUTE_TABLE_ID=$(aws ec2 describe-route-tables \
+  --filters Name=vpc-id,Values="$VPC_ID" Name=association.main,Values=true \
+  --query 'RouteTables[0].RouteTableId' --output text)
+
 aws ec2 create-vpc-endpoint \
   --vpc-id "$VPC_ID" --service-name com.amazonaws.us-east-1.s3 \
   --route-table-ids "$ROUTE_TABLE_ID" --vpc-endpoint-type Gateway
-
-# CloudWatch Logs interface endpoint — keeps job log shipping off the NAT Gateway
-aws ec2 create-vpc-endpoint \
-  --vpc-id "$VPC_ID" --service-name com.amazonaws.us-east-1.logs \
-  --vpc-endpoint-type Interface --subnet-ids <private-subnet-ids> \
-  --security-group-ids <sg-id>
 ```
 
-A NAT Gateway (or public subnets with public IPs, simpler but less isolated) is still
-needed for image pulls from quay.io/Docker Hub and for Modules 1/3's calls to NCBI
-Entrez/`datasets` — those aren't S3 traffic and aren't covered by the endpoints above.
+That's enough to run the pipeline. §4.2 below is an optional hardening pass, not a
+prerequisite — skip it unless you specifically want the compute environment isolated
+from the public internet.
 
-Security group for the compute environment and head node: allow all outbound (default),
-no inbound needed for the compute environment; for the head node, allow inbound SSH
-(port 22) from your IP only if you'll SSH in directly (Session Manager, §9, avoids
-needing this).
+### 4.2 Optional hardening: private subnets + NAT Gateway + interface endpoints
+
+If you'd rather the Batch compute environment's instances not have public IPs at all,
+move them into private subnets with a NAT Gateway for internet egress (image pulls from
+quay.io/Docker Hub, Modules 1/3's calls to NCBI Entrez/`datasets` — none of that is S3
+traffic, so it isn't covered by the S3 endpoint above), plus a CloudWatch Logs interface
+endpoint to keep job-log shipping off the NAT Gateway too:
+
+```bash
+# CloudWatch Logs interface endpoint (~$0.01/hr per AZ + data processing — skip this in 4.1's simple path)
+aws ec2 create-vpc-endpoint \
+  --vpc-id "$VPC_ID" --service-name com.amazonaws.us-east-1.logs \
+  --vpc-endpoint-type Interface --subnet-ids "<private-subnet-ids>" \
+  --security-group-ids "$SG_ID"
+```
+
+Setting up the private subnets, NAT Gateway, and route tables themselves is standard VPC
+work not specific to this pipeline — see the
+[AWS VPC user guide](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway.html)
+if you go this route. If you do, swap `$SUBNET_IDS_JSON`/`$SUBNET_ID` for your private
+subnet IDs in §8/§9 below.
 
 ---
 
@@ -322,7 +392,12 @@ aws.batch.volumes = '/usr/local/aws-cli'           // bind-mounted from the host
 
 No public image bundles both `sra-tools` (`fasterq-dump`) and the AWS CLI, which
 `SRA_FASTQ_AWSODP` (`2_download_fastq/modules/sra_fastq_awsodp/main.nf`) needs together.
-Build and push it once to a small private ECR repo:
+Build and push it once to a small private ECR repo.
+
+**Needs a real Docker daemon** — unlike the rest of this guide's setup commands, this
+step won't run in AWS CloudShell (no privileged Docker access there). Run it from your
+laptop, the head node (§9) once it exists, or any machine/CI system with Docker
+installed.
 
 ```bash
 aws ecr create-repository --repository-name mapped/sra-fastq-awsodp
@@ -352,25 +427,32 @@ via `AmazonEC2ContainerServiceforEC2Role`, so no extra IAM is needed for this on
 
 ## 8. AWS Batch compute environment & queue
 
+Uses `$VPC_ID`/`$SUBNET_IDS_JSON`/`$SG_ID` from §4 and `$ACCOUNT_ID` from §7:
+
 ```bash
+COMPUTE_RESOURCES=$(cat <<JSON
+{
+  "type": "SPOT",
+  "allocationStrategy": "SPOT_CAPACITY_OPTIMIZED",
+  "minvCpus": 0,
+  "maxvCpus": 256,
+  "desiredvCpus": 0,
+  "instanceTypes": ["optimal"],
+  "subnets": $SUBNET_IDS_JSON,
+  "securityGroupIds": ["$SG_ID"],
+  "instanceRole": "arn:aws:iam::$ACCOUNT_ID:instance-profile/MappedBatchInstanceProfile",
+  "launchTemplate": { "launchTemplateName": "mapped-batch-lt", "version": "\$Latest" },
+  "spotIamFleetRole": "arn:aws:iam::$ACCOUNT_ID:role/MappedSpotFleetRole"
+}
+JSON
+)
+
 aws batch create-compute-environment \
   --compute-environment-name mapped-spot-ce \
   --type MANAGED \
   --state ENABLED \
-  --service-role arn:aws:iam::$ACCOUNT_ID:role/MappedBatchServiceRole \
-  --compute-resources '{
-    "type": "SPOT",
-    "allocationStrategy": "SPOT_CAPACITY_OPTIMIZED",
-    "minvCpus": 0,
-    "maxvCpus": 256,
-    "desiredvCpus": 0,
-    "instanceTypes": ["optimal"],
-    "subnets": ["<private-subnet-id-1>", "<private-subnet-id-2>"],
-    "securityGroupIds": ["<sg-id>"],
-    "instanceRole": "arn:aws:iam::'"$ACCOUNT_ID"':instance-profile/MappedBatchInstanceProfile",
-    "launchTemplate": { "launchTemplateName": "mapped-batch-lt", "version": "$Latest" },
-    "spotIamFleetRole": "arn:aws:iam::'"$ACCOUNT_ID"':role/MappedSpotFleetRole"
-  }'
+  --service-role "arn:aws:iam::$ACCOUNT_ID:role/MappedBatchServiceRole" \
+  --compute-resources "$COMPUTE_RESOURCES"
 
 aws batch create-job-queue \
   --job-queue-name mapped-spot-queue \
@@ -395,13 +477,20 @@ preference, but "optimal" generally gets the best Spot availability.
 A small instance running `run_MAPPED.sh`/Nextflow itself — it doesn't do heavy
 computation (that's delegated to Batch), just orchestration.
 
+Uses `$SUBNET_ID`/`$SG_ID` from §4:
+
 ```bash
+AMI_ID=$(aws ssm get-parameter \
+  --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
+  --query 'Parameter.Value' --output text)
+
 aws ec2 run-instances \
-  --image-id <amazon-linux-2023-ami-id> \
+  --image-id "$AMI_ID" \
   --instance-type t3.medium \
   --iam-instance-profile Name=MappedHeadNodeProfile \
-  --subnet-id <subnet-id> \
-  --security-group-ids <sg-id> \
+  --subnet-id "$SUBNET_ID" \
+  --security-group-ids "$SG_ID" \
+  --associate-public-ip-address \
   --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":30}}]' \
   --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=mapped-head-node}]'
 ```
