@@ -504,7 +504,19 @@ issues covered elsewhere in this guide), and the job fails immediately on the ve
 Because `computeResources.securityGroupIds` (at the compute-environment level) and
 `NetworkInterfaces` (in the launch template) are mutually exclusive, requesting the
 public IP this way means moving the security group into the launch template too, and
-dropping it from `create-compute-environment` in §8:
+dropping it from `create-compute-environment` in §8.
+
+**The ECS-optimized AL2023 AMI doesn't include `unzip`, and "fixing" that by also
+installing `curl` breaks the fix.** `unzip awscliv2.zip` fails silently (command not
+found) unless you install it first — but AL2023 ships `curl` as the `curl-minimal`
+package, which already provides a fully working `curl` binary; explicitly installing the
+full `curl` package on top of it *conflicts* with `curl-minimal` and aborts the entire
+`yum install` transaction, silently taking `unzip` down with it if they're requested in
+the same command (`yum install -y unzip curl` fails outright; the fix that actually kept
+matters worse was chaining `|| dnf install -y unzip curl || true` — the `|| true` masked
+the failure entirely, so `unzip` silently never got installed either, and the script
+carried on to fail identically two steps later at `unzip`). Install *only* `unzip` —
+`curl-minimal` is already there and already works:
 
 ```bash
 cat > mapped-userdata.sh <<'EOF'
@@ -520,13 +532,14 @@ Content-Disposition: attachment; filename="install-awscli.sh"
 #!/bin/bash
 exec > /var/log/mapped-userdata.log 2>&1
 set -x
+yum install -y unzip
 cd /tmp
 curl -fsSL --max-time 60 "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
-unzip -q awscliv2.zip
+unzip -o -q awscliv2.zip
 ./aws/install
 mkdir -p /usr/local/aws-cli/bin
 ln -sf /usr/local/aws-cli/v2/current/bin/aws /usr/local/aws-cli/bin/aws
-ls -la /usr/local/aws-cli/bin/
+/usr/local/aws-cli/bin/aws --version
 
 --===============MAPPEDBOUNDARY==--
 EOF
@@ -548,9 +561,32 @@ aws ec2 create-launch-template \
 ```
 
 (`exec > /var/log/mapped-userdata.log 2>&1` plus `set -x` gives you somewhere to look if
-this ever fails again for a *different* reason — SSM into the instance while it's still
-running and check that log, since UserData failures otherwise leave no trace anywhere
-Batch/CloudWatch surfaces.)
+this ever fails again for a *different* reason — UserData failures otherwise leave no
+trace anywhere Batch/CloudWatch surfaces; `describe-compute-environments` and
+`describe-jobs` both keep reporting healthy right up until the job fails on the very
+first `aws`-dependent command, same as the other silent-failure classes in this guide.
+This is genuinely how the `curl`/`unzip` conflict above got found, after the Free-Tier,
+public-IP, and path-mismatch fixes all failed to resolve an identical-looking symptom and
+guessing further stopped being productive:
+
+1. **`MappedBatchInstanceRole` (§3.2) has no SSM permissions by default** — these worker
+   instances aren't manageable via Session Manager out of the box, unlike the head node.
+   Attach it temporarily for debugging: `aws iam attach-role-policy --role-name
+   MappedBatchInstanceRole --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore`
+   (harmless to leave attached afterward too, if you'd rather not detach it later).
+2. **Catching an instance before it terminates is the hard part** — a failed job's
+   instance can scale back down within under a minute, faster than IAM propagation plus
+   SSM agent registration on a *newly launched* instance in many cases. Relaunch the
+   smoke test, then poll aggressively (every 5-10s) for a new instance rather than
+   waiting: `aws ec2 describe-instances --query 'Reservations[].Instances[] |
+   sort_by(@, &LaunchTime) | [-1:]'` catches it by recency across the whole account,
+   which proved more reliable here than filtering on the `aws:batch:compute-environment`
+   tag (that tag appears to lag or not always apply promptly).
+3. Once `aws ssm describe-instance-information --filters Key=InstanceIds,Values=<id>
+   --query 'InstanceInformationList[0].PingStatus'` shows `Online`, `aws ssm
+   send-command` straight to `cat /var/log/mapped-userdata.log` — this is what actually
+   showed the `curl-minimal` conflict error verbatim, immediately, after three prior
+   fixes based on plausible-but-wrong guesses.)
 
 **If you fix the UserData on an *existing* launch template used by a compute
 environment already stuck `INVALID` with this reason, updating the template alone often
