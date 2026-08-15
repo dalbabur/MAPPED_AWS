@@ -35,69 +35,62 @@ process DOWNLOAD_REFERENCE {
 
     script:
     """
-    # First get the summary to find GenBank accession ID
-    datasets summary genome taxon '${organism}' --reference --assembly-source refseq > summary.json
-    
+    # Get the summary as JSON Lines and extract the RefSeq accession (GCF_...) and
+    # genome size via NCBI's own `dataformat` tool rather than hand-parsing JSON with
+    # grep/awk -- the pretty-printed report has multiple unrelated "*accession*" fields
+    # per record (biosample accession, bioproject accession, paired_accession, etc.), and
+    # naive pattern matching previously locked onto "paired_accession" (the record's
+    # linked GenBank/GCA counterpart) instead of the record's own top-level "accession"
+    # (its RefSeq/GCF accession, guaranteed present since --assembly-source refseq is
+    # set below). The paired GCA assembly frequently lacks the GCF's PGAP-generated
+    # GFF3/protein annotation files, which this process's output: block requires --
+    # silently failing every task with "missing output file(s)" despite the download
+    # script itself exiting 0, since the GCA package only ever contained the genome FASTA.
+    datasets summary genome taxon '${organism}' --reference --assembly-source refseq --as-json-lines > summary.jsonl
+
     # Check if we got any results
-    total_count=\$(grep '"total_count"' summary.json | sed 's/.*"total_count"[[:space:]]*:[[:space:]]*\\([0-9]*\\).*/\\1/')
-    
-    if [ -z "\$total_count" ] || [ "\$total_count" -eq 0 ]; then
+    if [ ! -s summary.jsonl ]; then
         echo "ERROR: No reference genomes found for ${organism}"
         exit 1
     fi
-    
+
+    total_count=\$(wc -l < summary.jsonl)
     echo "Found \$total_count reference genome(s)"
-    
-    # Extract all GCA accessions with their sizes
-    # Create a temporary file with GCA accession and size pairs
-    > gca_list.txt
-    
-    # Extract paired_accession and total_sequence_length from each report
-    # This handles multiple reports in the JSON
-    grep -B50 -A50 '"paired_accession"' summary.json | \
-    awk '
-        /"paired_accession".*"GCA_/ {
-            match(\$0, /"GCA_[^"]+/)
-            gca = substr(\$0, RSTART+1, RLENGTH-1)
-        }
-        /"total_sequence_length"/ && gca {
-            match(\$0, /[0-9]+/)
-            size = substr(\$0, RSTART, RLENGTH)
-            print gca, size
-            gca = ""
-        }
-    ' >> gca_list.txt
-    
-    # Check if we found any GCA accessions
+
+    dataformat tsv genome --inputfile summary.jsonl \
+        --fields accession,assmstats-total-sequence-len --elide-header > gca_list.txt
+
+    # Check if we found any accessions
     if [ ! -s gca_list.txt ]; then
-        echo "ERROR: No GenBank (GCA) accessions found in the reference genomes"
+        echo "ERROR: No RefSeq accessions found in the reference genomes"
         exit 1
     fi
-    
+
     # Sort by size (second column) and get the largest
     selected_gca=\$(sort -k2 -nr gca_list.txt | head -n1 | awk '{print \$1}')
-    
+
     if [ -z "\$selected_gca" ]; then
-        echo "ERROR: Failed to select a GenBank accession"
+        echo "ERROR: Failed to select a RefSeq accession"
         exit 1
     fi
-    
-    echo "Selected GenBank accession: \$selected_gca (largest genome)"
-    
-    # Download the specific GenBank accession
+
+    echo "Selected RefSeq accession: \$selected_gca (largest genome)"
+
+    # Download the specific RefSeq accession
     datasets download genome accession "\$selected_gca" --include gff3,protein,genome --filename ref.zip
-    
+
     # Extract and organize files
     unzip ref.zip -d tmp
-    
-    # Find the GCA directory
-    gca_dir=\$(find tmp/ncbi_dataset/data -mindepth 1 -maxdepth 1 -type d -name "GCA_*" | head -n1)
-    
+
+    # Find the downloaded assembly directory -- named exactly after the accession
+    # requested, so match it directly rather than assuming a GCA_/GCF_ prefix.
+    gca_dir=\$(find tmp/ncbi_dataset/data -mindepth 1 -maxdepth 1 -type d -name "\$selected_gca" | head -n1)
+
     if [ -z "\$gca_dir" ]; then
-        echo "Error: GenBank assembly directory not found after download"
+        echo "Error: Assembly directory not found after download"
         exit 1
     fi
-    
+
     mkdir -p ref_genome
     
     # Copy fna files
@@ -125,13 +118,13 @@ process DOWNLOAD_REFERENCE {
     done
     
     # Save the datasets summary
-    cp summary.json ref_genome/datasets_summary.json
-    
+    cp summary.jsonl ref_genome/datasets_summary.json
+
     # Ensure output files are world-readable for publishDir
     chmod a+r ref_genome/*
-    
+
     # Cleanup
-    rm -rf tmp ref.zip summary.json gca_list.txt
+    rm -rf tmp ref.zip summary.jsonl gca_list.txt
     """
 }
 
