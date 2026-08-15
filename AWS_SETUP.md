@@ -103,6 +103,27 @@ Four distinct roles. Don't collapse them into one broad role — the point of sp
 them is that a compromised or buggy pipeline job can only touch the pipeline's own
 bucket prefix, not your whole account.
 
+**Check for the account-wide Spot Fleet service-linked role first** — this is separate
+from all four roles below (those are specific to this pipeline's resources; this one is
+a foundational, account-wide role that AWS's Spot Fleet infrastructure itself depends
+on). AWS normally auto-creates it the first time *anything* in the account ever
+successfully uses Spot Fleet, but if this account never has, it won't exist yet — and
+its absence causes an extremely confusing, silent failure mode: the compute environment
+reports `VALID`/`Healthy`, correctly computes non-zero `desiredvCpus` in response to a
+submitted job, but never actually issues a Spot Fleet request or launches any EC2
+instance — no error anywhere, the job just sits `RUNNABLE` forever. This looks
+identical to a stuck/cached compute-environment state (and deleting/recreating the
+compute environment under a new name will *not* fix it, since the missing role is
+account-wide, not tied to any specific compute environment). Check and create it before
+troubleshooting anything else if you see a job stuck `RUNNABLE` with `desiredvCpus > 0`
+but no Spot Fleet requests in `aws ec2 describe-spot-fleet-requests`:
+
+```bash
+aws iam get-role --role-name AWSServiceRoleForEC2SpotFleet
+# NoSuchEntity means it's missing -- create it:
+aws iam create-service-linked-role --aws-service-name spotfleet.amazonaws.com
+```
+
 ### 3.1 AWS Batch service role
 
 Lets the Batch service itself manage EC2/Spot capacity on your behalf.
