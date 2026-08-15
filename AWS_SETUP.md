@@ -486,6 +486,26 @@ rejects it outright with `CLIENT_ERROR - Launch Template UserData is not MIME mu
 format` (Batch needs to merge its own bootstrap logic in, which requires the well-defined
 multipart structure to merge into). Wrap it:
 
+**The launch template must also explicitly request a public IP** — an EC2 instance
+launched directly into one of these subnets gets a public IP automatically (default-VPC
+subnets have `MapPublicIpOnLaunch` enabled), but instances AWS Batch launches on your
+behalf through its own internal Auto Scaling Group do *not* reliably inherit that subnet
+default. Without a public IP, the UserData's `curl` to `awscli.amazonaws.com` has no
+route out (this VPC has no NAT Gateway — see §4 — and the S3 gateway endpoint only
+covers S3 API traffic, not this), so it fails, `./aws/install` never runs, and *nothing*
+ends up at `/usr/local/aws-cli` regardless of what the rest of the script says — this
+produces the exact same `No such file or directory` symptom described above, and looks
+identical to a script bug even though the script itself never got to run. Symptom to
+watch for: the compute environment is `VALID`/`Healthy`, an EC2 instance genuinely
+launches and the job container starts (so it's *not* the Free Tier or stuck-validation
+issues covered elsewhere in this guide), and the job fails immediately on the very first
+`aws`-dependent command.
+
+Because `computeResources.securityGroupIds` (at the compute-environment level) and
+`NetworkInterfaces` (in the launch template) are mutually exclusive, requesting the
+public IP this way means moving the security group into the launch template too, and
+dropping it from `create-compute-environment` in §8:
+
 ```bash
 cat > mapped-userdata.sh <<'EOF'
 Content-Type: multipart/mixed; boundary="===============MAPPEDBOUNDARY=="
@@ -498,12 +518,15 @@ Content-Transfer-Encoding: 7bit
 Content-Disposition: attachment; filename="install-awscli.sh"
 
 #!/bin/bash
+exec > /var/log/mapped-userdata.log 2>&1
+set -x
 cd /tmp
-curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+curl -fsSL --max-time 60 "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
 unzip -q awscliv2.zip
 ./aws/install
 mkdir -p /usr/local/aws-cli/bin
 ln -sf /usr/local/aws-cli/v2/current/bin/aws /usr/local/aws-cli/bin/aws
+ls -la /usr/local/aws-cli/bin/
 
 --===============MAPPEDBOUNDARY==--
 EOF
@@ -515,9 +538,19 @@ aws ec2 create-launch-template \
     \"BlockDeviceMappings\": [{
       \"DeviceName\": \"/dev/xvda\",
       \"Ebs\": { \"VolumeSize\": 100, \"VolumeType\": \"gp3\", \"DeleteOnTermination\": true }
+    }],
+    \"NetworkInterfaces\": [{
+      \"DeviceIndex\": 0,
+      \"AssociatePublicIpAddress\": true,
+      \"Groups\": [\"$SG_ID\"]
     }]
   }"
 ```
+
+(`exec > /var/log/mapped-userdata.log 2>&1` plus `set -x` gives you somewhere to look if
+this ever fails again for a *different* reason — SSM into the instance while it's still
+running and check that log, since UserData failures otherwise leave no trace anywhere
+Batch/CloudWatch surfaces.)
 
 **If you fix the UserData on an *existing* launch template used by a compute
 environment already stuck `INVALID` with this reason, updating the template alone often
@@ -620,7 +653,11 @@ via `AmazonEC2ContainerServiceforEC2Role`, so no extra IAM is needed for this on
 
 ## 8. AWS Batch compute environment & queue
 
-Uses `$VPC_ID`/`$SUBNET_IDS_JSON`/`$SG_ID` from §4 and `$ACCOUNT_ID` from §7:
+Uses `$VPC_ID`/`$SUBNET_IDS_JSON` from §4 and `$ACCOUNT_ID` from §7. **No
+`securityGroupIds` here** — §6's launch template already carries the security group via
+its `NetworkInterfaces` block (needed for `AssociatePublicIpAddress`), and
+`computeResources.securityGroupIds` / launch-template `NetworkInterfaces` are mutually
+exclusive; specifying both fails `create-compute-environment` outright:
 
 ```bash
 COMPUTE_RESOURCES=$(cat <<JSON
@@ -632,7 +669,6 @@ COMPUTE_RESOURCES=$(cat <<JSON
   "desiredvCpus": 0,
   "instanceTypes": ["optimal"],
   "subnets": $SUBNET_IDS_JSON,
-  "securityGroupIds": ["$SG_ID"],
   "instanceRole": "arn:aws:iam::$ACCOUNT_ID:instance-profile/MappedBatchInstanceProfile",
   "launchTemplate": { "launchTemplateName": "mapped-batch-lt", "version": "\$Latest" },
   "spotIamFleetRole": "arn:aws:iam::$ACCOUNT_ID:role/MappedSpotFleetRole"
@@ -678,7 +714,6 @@ $computeResources = @"
   "desiredvCpus": 0,
   "instanceTypes": ["optimal"],
   "subnets": $SUBNET_IDS_JSON,
-  "securityGroupIds": ["$SG_ID"],
   "instanceRole": "arn:aws:iam::${ACCOUNT_ID}:instance-profile/MappedBatchInstanceProfile",
   "launchTemplate": { "launchTemplateName": "mapped-batch-lt", "version": "`$Latest" },
   "spotIamFleetRole": "arn:aws:iam::${ACCOUNT_ID}:role/MappedSpotFleetRole"
