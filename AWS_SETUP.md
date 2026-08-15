@@ -389,6 +389,14 @@ cat > lifecycle.json <<'EOF'
     { "ID": "expire-nextflow-work", "Filter": {"Prefix": "work/"}, "Status": "Enabled",
       "Expiration": {"Days": 14} },
     { "ID": "expire-raw-fastq", "Filter": {"Prefix": "results/seqFiles/fastq/"}, "Status": "Enabled",
+      "Expiration": {"Days": 30} },
+    { "ID": "expire-fastqc", "Filter": {"Prefix": "results/fastqc/"}, "Status": "Enabled",
+      "Expiration": {"Days": 30} },
+    { "ID": "expire-trimmed", "Filter": {"Prefix": "results/trimmed/"}, "Status": "Enabled",
+      "Expiration": {"Days": 30} },
+    { "ID": "expire-salmon", "Filter": {"Prefix": "results/salmon/"}, "Status": "Enabled",
+      "Expiration": {"Days": 30} },
+    { "ID": "expire-multiqc", "Filter": {"Prefix": "results/multiqc/"}, "Status": "Enabled",
       "Expiration": {"Days": 30} }
   ]
 }
@@ -397,7 +405,10 @@ aws s3api put-bucket-lifecycle-configuration \
   --bucket my-mapped-bucket --lifecycle-configuration file://lifecycle.json
 ```
 
-Leave `results/expression_matrices/` and `results/samplesheet/` (the equivalent of what
+All five expiring prefixes (`fastqc`, `trimmed`, `salmon`, `multiqc`, plus the raw
+`seqFiles/fastq`) are re-derivable by re-running the pipeline, matching exactly what
+local `--clean-mode` used to delete. Leave `results/expression_matrices/` and
+`results/samplesheet/` (the equivalent of what
 local `--clean-mode` preserves) with no expiration rule.
 
 ---
@@ -769,8 +780,10 @@ You shouldn't need to touch any of these day-to-day; just run `run_MAPPED.sh` wi
   per-process `errorStrategy`/`maxRetries` in `aws.config`, Spot reclaims are retried
   automatically rather than failing the run.
 - **Scale to zero**: `minvCpus: 0` means you pay nothing for compute between runs.
-- **S3 Lifecycle rules** (§5): expire `work/` and raw `seqFiles/fastq/` (both
-  re-derivable by re-running the pipeline) rather than paying to store them indefinitely.
+- **S3 Lifecycle rules** (§5): expire `work/` and all re-derivable intermediate outputs
+  (raw `seqFiles/fastq/`, `fastqc/`, `trimmed/`, `salmon/`, `multiqc/`) rather than paying
+  to store them indefinitely — only `expression_matrices/`/`samplesheet/` (the actual
+  deliverables) are kept with no expiration.
 - **VPC endpoints** (§4): avoid NAT Gateway data-processing charges for S3 and
   CloudWatch Logs traffic — usually the majority of this pipeline's network volume, since
   SRA ODP reads and S3 work-dir staging both go through them.
