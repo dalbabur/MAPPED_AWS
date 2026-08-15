@@ -1110,16 +1110,22 @@ print(f"\\nUpdated samplesheet: {len(samplesheet_df)} → {len(filtered_samplesh
 print("\\n=== PROCESSING GENE IDs ===")
 for matrix_name in matrix_files.keys():
     df = pd.read_csv(matrix_files[matrix_name], index_col=0)
-    
-    # Check if gene IDs start with 'gene-'
-    if df.index[0].startswith('gene-'):
+
+    # Empty matrices are legitimate, not an error -- e.g. log_tpm_norm.csv's row-mean
+    # centering trivially zeroes (and then drops) every gene when there's exactly one
+    # sample, since a single value's deviation from its own mean is always zero.
+    # df.index[0] raises IndexError on an empty index, so guard it explicitly instead
+    # of crashing the whole run over a downstream consequence of a small sample count.
+    if len(df) == 0:
+        print(f"{matrix_name}: Empty matrix (0 genes), skipping gene ID prefix check")
+    elif df.index[0].startswith('gene-'):
         print(f"{matrix_name}: Found 'gene-' prefix in gene IDs, removing...")
         # Remove 'gene-' prefix from all gene IDs
         df.index = df.index.str.replace('^gene-', '', regex=True)
         print(f"  Example: gene-WMS_00296 → WMS_00296")
     else:
         print(f"{matrix_name}: No 'gene-' prefix found in gene IDs")
-    
+
     # Save the processed matrix
     df.to_csv(matrix_name)
 
