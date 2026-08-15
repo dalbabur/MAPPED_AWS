@@ -3,7 +3,7 @@ set -euo pipefail
 
 function usage() {
   cat <<EOF
-Usage: $0 --organism ORGANISM --outdir OUTDIR --library_layout LIB_LAYOUT --workdir WORKDIR --clean-mode CLEAN_MODE --cpu CPU [--ref-accession REF_ACCESSION] [--max_concurrent_downloads N] [--strain STRAIN]
+Usage: $0 --organism ORGANISM --outdir OUTDIR --library_layout LIB_LAYOUT --workdir WORKDIR --clean-mode CLEAN_MODE --cpu CPU [--ref-accession REF_ACCESSION] [--max_concurrent_downloads N] [--strain STRAIN] [--bioproject BIOPROJECT] [--sra_accessions ACC1,ACC2,...]
 
 Options:
   --organism        Organism name (e.g., "Acinetobacter baylyi") - required for metadata download
@@ -23,6 +23,13 @@ Options:
                     Splits ScientificName on spaces and keeps rows where any token equals
                     or contains the provided string (case-insensitive).
                     Alias: '-strain' also accepted.
+  --bioproject      Optional: narrow the SRA metadata search to a specific BioProject
+                    accession (e.g. "PRJNA796354"), for targeting a named expression
+                    compendium instead of every RNA-seq run for --organism.
+  --sra_accessions  Optional: comma-separated list of exact SRA/ENA experiment
+                    accessions (e.g. "SRX14436231,SRX14436232"). Bypasses the
+                    organism/strategy search (and --bioproject) entirely -- use this for
+                    exact control over which samples run, such as a smoke test.
   --max_concurrent_downloads  Optional: Maximum number of concurrent downloads (default: 20)
   --aws_batch_queue        Optional: AWS Batch job queue name (only used with s3:// paths;
                     default 'mapped-spot-queue', see AWS_SETUP.md)
@@ -42,6 +49,8 @@ WORKDIR=""
 REF_ACCESSION=""
 MAX_CONCURRENT_DOWNLOADS=""
 STRAIN=""
+BIOPROJECT=""
+SRA_ACCESSIONS=""
 AWS_BATCH_QUEUE=""
 AWS_BATCH_JOB_ROLE_ARN=""
 
@@ -82,6 +91,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --strain|-strain)
       STRAIN="$2"
+      shift 2
+      ;;
+    --bioproject)
+      BIOPROJECT="$2"
+      shift 2
+      ;;
+    --sra_accessions)
+      SRA_ACCESSIONS="$2"
       shift 2
       ;;
     --aws_batch_queue)
@@ -159,7 +176,7 @@ fi
 # Step 1: Download metadata
 echo "=== Step 1: Download metadata ==="
 pushd 1_download_metadata_efetch > /dev/null 2>&1
-nextflow run main.nf ${NF_PROFILE_FLAG} -work-dir "$WORKDIR" --organism "$ORGANISM" --outdir "$OUTDIR" --library_layout "$LIB_LAYOUT" ${STRAIN:+--strain "$STRAIN"} ${AWS_BATCH_QUEUE:+--aws_batch_queue "$AWS_BATCH_QUEUE"} ${AWS_BATCH_JOB_ROLE_ARN:+--aws_batch_job_role_arn "$AWS_BATCH_JOB_ROLE_ARN"} -resume
+nextflow run main.nf ${NF_PROFILE_FLAG} -work-dir "$WORKDIR" --organism "$ORGANISM" --outdir "$OUTDIR" --library_layout "$LIB_LAYOUT" ${STRAIN:+--strain "$STRAIN"} ${BIOPROJECT:+--bioproject "$BIOPROJECT"} ${SRA_ACCESSIONS:+--sra_accessions "$SRA_ACCESSIONS"} ${AWS_BATCH_QUEUE:+--aws_batch_queue "$AWS_BATCH_QUEUE"} ${AWS_BATCH_JOB_ROLE_ARN:+--aws_batch_job_role_arn "$AWS_BATCH_JOB_ROLE_ARN"} -resume
 popd > /dev/null 2>&1
 
 # Step 2: Download FASTQ

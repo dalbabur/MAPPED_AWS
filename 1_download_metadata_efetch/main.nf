@@ -4,6 +4,11 @@ params.organism = null
 params.outdir = null
 // Ensure optional 'strain' is never null to satisfy 'val' input
 params.strain = ''
+// Optional: narrow the SRA search to a specific BioProject (e.g. a named expression
+// compendium like PRECISE), or bypass the organism/strategy search entirely in favor of
+// an exact, comma-separated list of SRA/ENA experiment accessions.
+params.bioproject = ''
+params.sra_accessions = ''
 
 process FETCH_METADATA {
 
@@ -18,8 +23,17 @@ process FETCH_METADATA {
         path 'tmp_metadata.tsv'
 
     script:
-
-        def query = '"' + organism + '"[Organism] AND "rna seq"[Strategy] AND "transcriptomic"[Source]'
+        // An explicit accession list takes full control of sample selection -- bypasses
+        // the organism/strategy search (and any --bioproject filter) entirely, since it
+        // already identifies the exact experiments wanted.
+        def query
+        if (params.sra_accessions) {
+            def accs = params.sra_accessions.split(',').collect { it.trim() }.findAll { it }
+            query = accs.collect { "\"${it}\"[Accession]" }.join(' OR ')
+        } else {
+            def bioprojectClause = params.bioproject ? " AND \"${params.bioproject}\"[BioProject]" : ''
+            query = '"' + organism + '"[Organism] AND "rna seq"[Strategy] AND "transcriptomic"[Source]' + bioprojectClause
+        }
         """
         esearch -db sra -query '${query}' | efetch -db sra -format runinfo > tmp_metadata.tsv
         """
