@@ -3,8 +3,6 @@
 //
 params.outdir    = null
 params.cpu = params.cpu ?: 20
-params.ref_genome = null
-params.ref_gff = null
 
 // Note: the --outdir requiredness check and the reference-genome/GFF auto-detection
 // that used to live here (as top-level `if`/`def` statements) now live at the top of
@@ -1155,17 +1153,23 @@ workflow {
     // Auto-detect reference genome and GFF in seqFiles/ref_genome under outdir.
     // Uses Nextflow's file()/Path API (not java.io.File) so this also works when
     // params.outdir is an s3:// URI, not just a local path.
+    //
+    // Resolved into plain local variables, not params.ref_genome/params.ref_gff --
+    // reassigning a params.* value after its initial declaration triggers Nextflow's
+    // "defined multiple times" warning and the reassignment is silently discarded, so a
+    // params-based version of this always left params.ref_genome/ref_gff null downstream
+    // (surfacing as "Argument of file() function cannot be null" at the EXTRACT_CDS call).
     def refDir = file("${params.outdir}/seqFiles/ref_genome")
     if ( ! refDir.exists() ) error "Reference genome directory not found: ${refDir}"
     def refDirFiles = refDir.listFiles()
     def fastaFiles = refDirFiles.findAll { it.name.endsWith('.fna') || it.name.endsWith('.fa') }
     if ( fastaFiles.size() == 0 ) error "No FASTA (.fna/.fa) file found in ${refDir}"
     if ( fastaFiles.size() > 1 ) error "Multiple FASTA files found in ${refDir}: ${fastaFiles*.name}"
-    params.ref_genome = fastaFiles[0].toUriString()
+    def refGenome = fastaFiles[0]
     def gffFiles = refDirFiles.findAll { it.name.endsWith('.gff') }
     if ( gffFiles.size() == 0 ) error "No GFF (.gff) file found in ${refDir}"
     if ( gffFiles.size() > 1 ) error "Multiple GFF files found in ${refDir}: ${gffFiles*.name}"
-    params.ref_gff = gffFiles[0].toUriString()
+    def refGff = gffFiles[0]
 
     // load samples from the original download samplesheet
     samples_ch = Channel
@@ -1201,7 +1205,7 @@ workflow {
         }
 
     // build index
-    cds_fa_ch       = EXTRACT_CDS( file(params.ref_genome), file(params.ref_gff) )
+    cds_fa_ch       = EXTRACT_CDS( refGenome, refGff )
     salmon_index_ch = SALMON_INDEX(cds_fa_ch)
 
     // trim
