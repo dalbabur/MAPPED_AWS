@@ -7,7 +7,9 @@ process SRA_FASTQ_AWSODP {
     label 'error_retry'
     publishDir "${params.outdir}/seqFiles/fastq", mode: params.publish_dir_mode
 
-    container "${params.sra_awsodp_container ?: 'public.ecr.aws/YOUR_ECR_ALIAS/mapped/sra-fastq-awsodp:1.0'}"
+    // Default points at this deployment's private ECR repo (see AWS_SETUP.md §7).
+    // Override with --sra_awsodp_container if you push to a different account/repo.
+    container "${params.sra_awsodp_container ?: '347076821446.dkr.ecr.us-east-1.amazonaws.com/mapped/sra-fastq-awsodp:1.0'}"
 
     input:
     tuple val(meta), val(run_accession)

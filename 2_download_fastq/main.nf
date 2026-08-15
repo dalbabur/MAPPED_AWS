@@ -10,17 +10,6 @@ include { SRA_IDS_TO_RUNINFO      } from './modules/sra_ids_to_runinfo'
 include { SRA_RUNINFO_TO_FTP      } from './modules/sra_runinfo_to_ftp'
 include { SRA_TO_SAMPLESHEET      } from './modules/sra_to_samplesheet'
 
-// Make Python scripts in bin folder executable
-"chmod +x ${projectDir}/bin/sra_ids_to_runinfo.py".execute().waitFor()
-"chmod +x ${projectDir}/bin/sra_runinfo_to_ftp.py".execute().waitFor()
-
-// Define input channel for sample IDs from metadata CSV in workdir
-Channel
-    .fromPath("${params.outdir}/metadata/sample_id.csv")
-    .splitCsv(header:true)
-    .map { row -> row.values().first() }
-    .set { ids }
-
 // Add process to clean rotated Nextflow logs
 process CLEAN_NEXTFLOW_LOG {
     cache false
@@ -35,8 +24,19 @@ process CLEAN_NEXTFLOW_LOG {
 workflow {
 
     main:
+    // Make Python scripts in bin folder executable (moved here, not top-level script
+    // scope -- Nextflow 26.x rejects bare statements outside a process/workflow/function)
+    "chmod +x ${projectDir}/bin/sra_ids_to_runinfo.py".execute().waitFor()
+    "chmod +x ${projectDir}/bin/sra_runinfo_to_ftp.py".execute().waitFor()
+
+    // Input channel for sample IDs from metadata CSV in workdir (same reason, moved here)
+    ids = Channel
+        .fromPath("${params.outdir}/metadata/sample_id.csv")
+        .splitCsv(header:true)
+        .map { row -> row.values().first() }
+
     ch_versions = Channel.empty()
-    
+
     // Log concurrent download limit
     log.info "Download concurrency limit set to: ${params.max_concurrent_downloads ?: 20}"
 

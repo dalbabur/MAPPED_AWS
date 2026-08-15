@@ -54,12 +54,45 @@ every `nextflow run` invocation.
 
 ## 2. Account & region setup
 
+You'll be running commands from (at least) two places: AWS CloudShell or the console
+(already authenticated via your AWS login — no setup needed) and your own local machine
+(needs the AWS CLI installed and credentials configured, since it has no ambient AWS
+login of its own). If your local machine has no working `aws sts get-caller-identity`
+yet, create an IAM user and access key for it — do this part from CloudShell/console,
+where you're already authenticated:
+
 ```bash
-aws configure set region us-east-1
-aws sts get-caller-identity   # confirms your credentials/account
+aws iam create-user --user-name mapped-admin
+aws iam attach-user-policy --user-name mapped-admin \
+  --policy-arn arn:aws:iam::aws:policy/AdministratorAccess
+aws iam create-access-key --user-name mapped-admin
 ```
 
-Do all of the following in `us-east-1` unless stated otherwise.
+Copy the `AccessKeyId`/`SecretAccessKey` from that last command's output immediately —
+the secret is shown only once. Then, on your local machine, in a fresh terminal:
+
+```bash
+aws configure   # paste the access key/secret; region: us-east-1
+aws sts get-caller-identity   # should now show mapped-admin
+```
+
+Once initial setup is done, consider deleting this access key or scoping the user down
+(§1 already assumes `AdministratorAccess` only for initial setup, not ongoing use).
+
+```bash
+export AWS_DEFAULT_REGION=us-east-1   # takes precedence over ~/.aws/config; also run this
+                                       # in any new shell/CloudShell tab you use for later steps
+aws configure set region us-east-1
+aws sts get-caller-identity   # confirms your credentials/account
+aws configure get region      # should print us-east-1 -- if not, see note below
+```
+
+Do all of the following in `us-east-1` unless stated otherwise. **If a later command
+fails with something like `Endpoint type (Gateway) does not match available service
+types ([Interface])`**, that's a symptom of this session actually targeting a different
+region (an `AWS_REGION`/`AWS_DEFAULT_REGION` env var, a CloudShell tab pointed elsewhere,
+or a named profile with its own region, can all silently override the `configure set`
+above) — re-run the `export` line above in that shell and retry.
 
 ---
 
@@ -307,6 +340,20 @@ subnet IDs in §8/§9 below.
 
 ## 5. S3 layout
 
+`my-mapped-bucket` below is a placeholder — S3 bucket names are globally unique across
+*all* AWS accounts, not just yours, so it's almost certainly already taken. Pick a real
+name (e.g. `mapped-pipeline-<your-account-id>` is a simple, collision-proof convention)
+before running any of this.
+
+**Important, since §3 (IAM) comes before this section:** the job role and head-node role
+policies in §3.3/§3.5 were written referencing this same placeholder bucket name, because
+this bucket doesn't exist yet at that point in the guide. Once you've created the real
+bucket below, go back and re-run those two `put-role-policy` commands with the real
+bucket name substituted in — otherwise both roles are scoped to a bucket that doesn't
+exist, and Batch jobs/the head node get silent `AccessDenied` errors against the real
+one. (This is exactly what happened working through this guide the first time — easy to
+miss since nothing errors until you actually try to read/write S3.)
+
 ```bash
 aws s3 mb s3://my-mapped-bucket --region us-east-1
 aws s3api put-bucket-versioning --bucket my-mapped-bucket \
@@ -394,16 +441,18 @@ No public image bundles both `sra-tools` (`fasterq-dump`) and the AWS CLI, which
 `SRA_FASTQ_AWSODP` (`2_download_fastq/modules/sra_fastq_awsodp/main.nf`) needs together.
 Build and push it once to a small private ECR repo.
 
-**Needs a real Docker daemon** — unlike the rest of this guide's setup commands, this
-step won't run in AWS CloudShell (no privileged Docker access there). Run it from your
-laptop, the head node (§9) once it exists, or any machine/CI system with Docker
-installed.
+**Needs a real Docker daemon and this repo checked out** — AWS CloudShell does support
+Docker, so it works fine here too; just make sure you `git clone` this repo into the
+CloudShell session first (`docker build` needs `docker/sra-fastq-awsodp/` to exist in
+your current directory — CloudShell's `$HOME` is a separate filesystem from wherever you
+edited the repo). Same applies wherever else you run this: your laptop, the head node
+(§9), or any CI system.
 
 ```bash
 aws ecr create-repository --repository-name mapped/sra-fastq-awsodp
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-aws ecr get-login-password | docker login --username AWS --password-stdin \
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin \
   "$ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com"
 
 docker build -t sra-fastq-awsodp:1.0 docker/sra-fastq-awsodp
@@ -412,13 +461,29 @@ docker tag sra-fastq-awsodp:1.0 \
 docker push "$ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/mapped/sra-fastq-awsodp:1.0"
 ```
 
-Then point the pipeline at it (either edit the default in
-`2_download_fastq/modules/sra_fastq_awsodp/main.nf`, or pass it at runtime):
+**Two gotchas hit while validating this (2026-08-14), both worth knowing about:**
+- `aws ecr get-login-password` tokens are short-lived. If you `docker build` between
+  logging in and pushing (normal — the build can take a few minutes), the token may
+  already be stale by push time, failing with `no basic auth credentials`. Just re-run
+  the `get-login-password | docker login` line again immediately before `docker push`.
+- **On Windows PowerShell specifically**, piping `aws ecr get-login-password` straight
+  into `docker login --password-stdin` can silently corrupt the token (fails with
+  `400 Bad Request` on login) — a pipe-encoding quirk between the two native processes.
+  If that happens, capture the token into a variable first and pass it as an argument
+  instead: `$p = (aws ecr get-login-password --region us-east-1).Trim(); docker login --username AWS --password $p <registry>`
+  (Docker will warn that `--password` is insecure since it's visible in process
+  args/history — fine for this short-lived, low-value token; don't do this for anything
+  longer-lived). This isn't an issue in CloudShell/Git Bash/Linux — only Windows
+  PowerShell's native-pipe handling triggers it.
 
-```bash
-./run_MAPPED.sh ... \
-  -c <(echo "params.sra_awsodp_container = '$ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/mapped/sra-fastq-awsodp:1.0'")
-```
+Verified working end-to-end against this account: built, pushed, and smoke-tested with a
+real SRA run (`aws s3 cp --no-sign-request` + `fasterq-dump` both succeeded, producing
+correct paired FASTQ). **The pipeline's default already points at the image pushed
+here** (`2_download_fastq/modules/sra_fastq_awsodp/main.nf`) — if you're deploying to a
+*different* AWS account, update that default to your own pushed image's URI, or pass
+`--sra_awsodp_container <your-uri>` at runtime (note: add it to `run_MAPPED.sh`'s
+pass-through flags first, the same way `--aws_batch_queue` is wired up, if you want it as
+a CLI flag rather than editing the file).
 
 The compute environment's EC2 instance role (§3.2) already includes ECR pull permissions
 via `AmazonEC2ContainerServiceforEC2Role`, so no extra IAM is needed for this one image.
@@ -461,6 +526,48 @@ aws batch create-job-queue \
   --compute-environment-order order=1,computeEnvironment=mapped-spot-ce
 ```
 
+**On Windows PowerShell**, passing that JSON inline to `--compute-resources` doesn't work
+the same way — PowerShell's argument marshaling to native executables strips the quotes
+out of an inline JSON string before `aws.exe` ever sees it, producing an
+`Invalid JSON: Expecting property name enclosed in double quotes` error. Write it to a
+file instead and reference it with `file://`, which sidesteps the quoting entirely
+(verified working 2026-08-14):
+
+```powershell
+$AWS = "C:\Program Files\Amazon\AWSCLIV2\aws.exe"
+$SUBNET_IDS_JSON = (& $AWS ec2 describe-subnets --region us-east-1 --filters Name=vpc-id,Values=$VPC_ID --query 'Subnets[].SubnetId' --output json | Out-String)
+
+$computeResources = @"
+{
+  "type": "SPOT",
+  "allocationStrategy": "SPOT_CAPACITY_OPTIMIZED",
+  "minvCpus": 0,
+  "maxvCpus": 256,
+  "desiredvCpus": 0,
+  "instanceTypes": ["optimal"],
+  "subnets": $SUBNET_IDS_JSON,
+  "securityGroupIds": ["$SG_ID"],
+  "instanceRole": "arn:aws:iam::${ACCOUNT_ID}:instance-profile/MappedBatchInstanceProfile",
+  "launchTemplate": { "launchTemplateName": "mapped-batch-lt", "version": "`$Latest" },
+  "spotIamFleetRole": "arn:aws:iam::${ACCOUNT_ID}:role/MappedSpotFleetRole"
+}
+"@
+$jsonPath = "$env:TEMP\mapped-compute-resources.json"
+[System.IO.File]::WriteAllText($jsonPath, $computeResources, [System.Text.UTF8Encoding]::new($false))
+
+& $AWS batch create-compute-environment --region us-east-1 `
+  --compute-environment-name mapped-spot-ce --type MANAGED --state ENABLED `
+  --service-role "arn:aws:iam::${ACCOUNT_ID}:role/MappedBatchServiceRole" `
+  --compute-resources "file://$jsonPath"
+```
+
+Note `` `$Latest `` (backtick-escaped) inside the here-string — without it, PowerShell
+tries to expand `$Latest` as a variable (and silently substitutes empty string) rather
+than passing the literal text AWS Batch expects for "always use the newest launch
+template version." The `[System.IO.File]::WriteAllText(...)` with an explicit
+no-BOM UTF8 encoding matters too — Windows PowerShell 5.1's `Out-File`/`Set-Content`
+default to UTF-8 *with* a BOM, which the AWS CLI's JSON parser chokes on.
+
 `minvCpus: 0` lets the compute environment scale to zero (no cost) when nothing is
 running — Batch launches Spot instances on demand when jobs are submitted, and
 terminates them when the queue empties. `"instanceTypes": ["optimal"]` lets Batch pick
@@ -477,6 +584,20 @@ preference, but "optimal" generally gets the best Spot availability.
 A small instance running `run_MAPPED.sh`/Nextflow itself — it doesn't do heavy
 computation (that's delegated to Batch), just orchestration.
 
+**Instance type: check Free Tier eligibility first if this account has restrictions.**
+`t3.medium` failed here with `InvalidParameterCombination: The specified instance type is
+not eligible for Free Tier` on a Free-Tier-restricted account. Check what's actually
+eligible before picking one:
+
+```bash
+aws ec2 describe-instance-types --region us-east-1 \
+  --filters Name=free-tier-eligible,Values=true --query 'InstanceTypes[].InstanceType'
+```
+
+`t3.small` (2 GiB RAM) worked and is plenty for orchestration-only work — avoid the
+`t4g.*` options in that list if you do this, they're ARM/Graviton and won't match the
+x86_64 AMI below.
+
 Uses `$SUBNET_ID`/`$SG_ID` from §4:
 
 ```bash
@@ -486,7 +607,7 @@ AMI_ID=$(aws ssm get-parameter \
 
 aws ec2 run-instances \
   --image-id "$AMI_ID" \
-  --instance-type t3.medium \
+  --instance-type t3.small \
   --iam-instance-profile Name=MappedHeadNodeProfile \
   --subnet-id "$SUBNET_ID" \
   --security-group-ids "$SG_ID" \
@@ -495,23 +616,67 @@ aws ec2 run-instances \
   --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=mapped-head-node}]'
 ```
 
-On the instance (SSH, or [AWS Systems Manager Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html)
-if you'd rather not open port 22):
+**On Windows PowerShell**, the same JSON-quoting problem from §8 applies to
+`--block-device-mappings`/`--tag-specifications` here too. The fix here is simpler than
+§8's file-based workaround: both parameters accept AWS CLI's shorthand syntax instead of
+raw JSON, which has no embedded double quotes to get mangled — just wrap each in single
+quotes (verified working):
+
+```powershell
+--block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=30}' `
+--tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=mapped-head-node}]'
+```
+
+Give it a couple minutes after `run-instances` before it's reachable — wait for
+`aws ec2 wait instance-running`, then, **if you attached the SSM policy from §3.5 after
+already creating `MappedHeadNodeRole`** (easy to do if you're working through this guide
+non-linearly), double check it's actually attached before assuming Session Manager will
+work:
 
 ```bash
-# Java (Nextflow requires 17+)
-sudo yum install -y java-17-amazon-corretto-headless git
+aws iam list-attached-role-policies --role-name MappedHeadNodeRole
+```
+
+An empty result here (role exists, but nothing attached) was the actual root cause the
+one time this got stuck — SSM registration silently never happens without it, with no
+useful error message pointing at IAM. If you find and fix a missing attachment on an
+*already-running* instance, don't just wait — IAM instance profile credentials aren't
+always refreshed promptly enough for the SSM agent to notice quickly; terminating and
+relaunching (now that the role is correct from boot) is more reliable than waiting
+indefinitely for it to pick up the change.
+
+Connect via SSH, or [AWS Systems Manager Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html)
+if you'd rather not open port 22 (needs `AmazonSSMManagedInstanceCore` on
+`MappedHeadNodeRole`, per §3.5 — confirm `aws ssm describe-instance-information
+--filters Key=InstanceIds,Values=<id>` shows `PingStatus: Online` before trying to
+connect). Non-interactively (e.g. scripting this setup, or from a CLI-only session),
+`aws ssm send-command --document-name AWS-RunShellScript` works well and lets you poll
+results with `aws ssm get-command-invocation`, without needing an interactive shell at
+all — that's how this section was actually validated.
+
+On the instance:
+
+```bash
+# Java (Nextflow requires 17+) and AWS CLI (for the sample-count summary /
+# clean-mode-guard branches in run_MAPPED.sh) -- both in one go
+sudo yum install -y java-17-amazon-corretto-headless git aws-cli
 
 # Nextflow
 curl -s https://get.nextflow.io | bash
 sudo mv nextflow /usr/local/bin/
 
-# AWS CLI (for the sample-count summary / clean-mode-guard branches in run_MAPPED.sh)
-sudo yum install -y aws-cli
-
-git clone <your-fork-of-this-repo>
+git clone https://github.com/dalbabur/MAPPED_AWS.git
 cd MAPPED_AWS
 ```
+
+**The repo needs to be publicly cloneable for the plain `git clone` above to work
+non-interactively** — a private repo fails with `could not read Username for
+'https://github.com': No such device or address` (git trying to prompt for credentials
+with no terminal to prompt on). Either make the repo public, or use a GitHub
+fine-grained, read-only, single-repo access token embedded in the clone URL
+(`https://<token>@github.com/...`) if it needs to stay private. If you just flipped a
+repo from private to public, give GitHub's edge caches a few seconds — an immediate
+clone attempt can still 404/fail once before consistently succeeding.
 
 **Alternative**: [AWS Cloud9](https://aws.amazon.com/cloud9/) gives you the same thing
 (a persistent Linux environment with an IAM role attached) with less EC2 lifecycle

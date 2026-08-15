@@ -2,28 +2,17 @@
 // Required parameters
 //
 params.outdir    = null
-
-if ( ! params.outdir )    error "Please provide --outdir"
-
-// Resource configuration: threads per task and max parallel runs
 params.cpu = params.cpu ?: 20
-def threads_per_task = 4
-def max_parallel = (params.cpu / threads_per_task) as Integer
+params.ref_genome = null
+params.ref_gff = null
 
-// Auto-detect reference genome and GFF in seqFiles/ref_genome under outdir.
-// Uses Nextflow's file()/Path API (not java.io.File) so this also works when
-// params.outdir is an s3:// URI, not just a local path.
-def refDir = file("${params.outdir}/seqFiles/ref_genome")
-if ( ! refDir.exists() ) error "Reference genome directory not found: ${refDir}"
-def refDirFiles = refDir.listFiles()
-def fastaFiles = refDirFiles.findAll { it.name.endsWith('.fna') || it.name.endsWith('.fa') }
-if ( fastaFiles.size() == 0 ) error "No FASTA (.fna/.fa) file found in ${refDir}"
-if ( fastaFiles.size() > 1 ) error "Multiple FASTA files found in ${refDir}: ${fastaFiles*.name}"
-params.ref_genome = fastaFiles[0].toUriString()
-def gffFiles = refDirFiles.findAll { it.name.endsWith('.gff') }
-if ( gffFiles.size() == 0 ) error "No GFF (.gff) file found in ${refDir}"
-if ( gffFiles.size() > 1 ) error "Multiple GFF files found in ${refDir}: ${gffFiles*.name}"
-params.ref_gff = gffFiles[0].toUriString()
+// Note: the --outdir requiredness check and the reference-genome/GFF auto-detection
+// that used to live here (as top-level `if`/`def` statements) now live at the top of
+// workflow{} below instead -- Nextflow (26.x+) rejects bare statements mixed with
+// script declarations (process/workflow definitions) at the top level of the script.
+// threads_per_task (always 4) and max_parallel (params.cpu/4) are inlined directly into
+// each process's cpus/maxForks directives below for the same reason, rather than kept as
+// shared top-level variables.
 
 // Process: extract CDS
 //
@@ -73,8 +62,8 @@ process FASTQC {
     tag '$sample'
     container 'quay.io/biocontainers/fastqc:0.12.1--hdfd78af_0'
     publishDir "${params.outdir}/fastqc", mode: 'copy'
-    cpus threads_per_task
-    maxForks max_parallel
+    cpus 4
+    maxForks { (params.cpu / 4) as Integer }
     errorStrategy 'ignore'
 
     input:
@@ -111,8 +100,8 @@ process TRIMGALORE {
     tag '$sample'
     container 'quay.io/biocontainers/trim-galore:0.6.9--hdfd78af_0'
     publishDir "${params.outdir}/trimmed", mode: 'copy'
-    cpus threads_per_task
-    maxForks max_parallel
+    cpus 4
+    maxForks { (params.cpu / 4) as Integer }
     errorStrategy 'ignore'
 
     input:
@@ -152,8 +141,8 @@ process SALMON_QUANT {
     tag '$sample'
     container 'quay.io/biocontainers/salmon:1.10.3--h45fbf2d_4'
     publishDir "${params.outdir}/salmon", mode: 'copy'
-    cpus threads_per_task
-    maxForks max_parallel
+    cpus 4
+    maxForks { (params.cpu / 4) as Integer }
     errorStrategy 'ignore'
 
     input:
@@ -1154,6 +1143,23 @@ EOF
 // Main workflow
 //
 workflow {
+    if ( ! params.outdir )    error "Please provide --outdir"
+
+    // Auto-detect reference genome and GFF in seqFiles/ref_genome under outdir.
+    // Uses Nextflow's file()/Path API (not java.io.File) so this also works when
+    // params.outdir is an s3:// URI, not just a local path.
+    def refDir = file("${params.outdir}/seqFiles/ref_genome")
+    if ( ! refDir.exists() ) error "Reference genome directory not found: ${refDir}"
+    def refDirFiles = refDir.listFiles()
+    def fastaFiles = refDirFiles.findAll { it.name.endsWith('.fna') || it.name.endsWith('.fa') }
+    if ( fastaFiles.size() == 0 ) error "No FASTA (.fna/.fa) file found in ${refDir}"
+    if ( fastaFiles.size() > 1 ) error "Multiple FASTA files found in ${refDir}: ${fastaFiles*.name}"
+    params.ref_genome = fastaFiles[0].toUriString()
+    def gffFiles = refDirFiles.findAll { it.name.endsWith('.gff') }
+    if ( gffFiles.size() == 0 ) error "No GFF (.gff) file found in ${refDir}"
+    if ( gffFiles.size() > 1 ) error "Multiple GFF files found in ${refDir}: ${gffFiles*.name}"
+    params.ref_gff = gffFiles[0].toUriString()
+
     // load samples from the original download samplesheet
     samples_ch = Channel
         .fromPath( file("${params.outdir}/samplesheet/samplesheet_download.csv") )

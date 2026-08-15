@@ -1,7 +1,5 @@
 #!/usr/bin/env nextflow
 
-def runStartTime = System.currentTimeMillis()
-
 params.organism = null
 params.outdir = null
 // Ensure optional 'strain' is never null to satisfy 'val' input
