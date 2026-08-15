@@ -17,7 +17,7 @@ process SRA_IDS_TO_RUNINFO {
     def metadata_fields = fields ? "--ena_metadata_fields ${fields}" : ''
     """
     echo $id > id.txt
-    ${workflow.projectDir}/bin/sra_ids_to_runinfo.py \\
+    sra_ids_to_runinfo.py \\
         id.txt \\
         ${id}.runinfo.tsv \\
         $metadata_fields

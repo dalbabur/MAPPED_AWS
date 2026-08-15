@@ -12,7 +12,7 @@ process SRA_RUNINFO_TO_FTP {
 
     script:
     """
-    ${workflow.projectDir}/bin/sra_runinfo_to_ftp.py \\
+    sra_runinfo_to_ftp.py \\
         ${runinfo.join(',')} \\
         ${runinfo.toString().tokenize(".")[0]}.runinfo_ftp.tsv
 
