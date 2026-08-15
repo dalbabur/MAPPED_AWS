@@ -412,14 +412,30 @@ path `aws.config` expects (`/usr/local/aws-cli`), and bind-mount it into every c
 This also increases the root EBS volume — default sizes are too small once you're
 downloading FASTQ + a Salmon index + a reference genome per instance.
 
+**UserData must be MIME multipart, not a plain script** — a bare `#!/bin/bash` script
+works for standalone EC2 instances, but AWS Batch's compute environment validation
+rejects it outright with `CLIENT_ERROR - Launch Template UserData is not MIME multipart
+format` (Batch needs to merge its own bootstrap logic in, which requires the well-defined
+multipart structure to merge into). Wrap it:
+
 ```bash
 cat > mapped-userdata.sh <<'EOF'
+Content-Type: multipart/mixed; boundary="===============MAPPEDBOUNDARY=="
+MIME-Version: 1.0
+
+--===============MAPPEDBOUNDARY==
+Content-Type: text/x-shellscript; charset="us-ascii"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+Content-Disposition: attachment; filename="install-awscli.sh"
+
 #!/bin/bash
 cd /tmp
 curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
 unzip -q awscliv2.zip
 ./aws/install
-rm -rf awscliv2.zip aws
+
+--===============MAPPEDBOUNDARY==--
 EOF
 
 aws ec2 create-launch-template \
@@ -431,6 +447,33 @@ aws ec2 create-launch-template \
       \"Ebs\": { \"VolumeSize\": 100, \"VolumeType\": \"gp3\", \"DeleteOnTermination\": true }
     }]
   }"
+```
+
+**If you fix the UserData on an *existing* launch template used by a compute
+environment already stuck `INVALID` with this reason, updating the template alone often
+isn't enough** — pushing a new launch template version (even a byte-verified-correct
+one) may leave the compute environment reporting the exact same stale `INVALID` status
+indefinitely; `update-compute-environment --state ENABLED` (a no-op re-set) and even a
+real `ENABLED`→`DISABLED`→`ENABLED` transition don't reliably force re-validation either.
+Two additional wrinkles if you go looking for a lighter fix: (a) compute environments
+created with a **custom** (non-service-linked) Batch service role — which is what §3.1
+sets up — reject `update-compute-environment --compute-resources` changes to
+`launchTemplate` entirely (`ClientException: ... can be updated only for ... Compute
+Environment having a Batch Service Linked Role`); (b) that's not this repo's setup, so
+don't switch service roles just to unblock this. The reliable fix is to disable and
+delete both the job queue and the compute environment, then recreate them fresh
+(pinning `launchTemplate.version` to the specific corrected version number, not
+`$Latest`, removes any ambiguity about which version a fresh create resolves):
+
+```bash
+aws batch update-job-queue --job-queue mapped-spot-queue --state DISABLED
+# wait for job queue status: DISABLED (poll describe-job-queues)
+aws batch delete-job-queue --job-queue mapped-spot-queue
+# wait for it to disappear from describe-job-queues, THEN:
+aws batch delete-compute-environment --compute-environment mapped-spot-ce
+# wait for it to disappear from describe-compute-environments, THEN re-run
+# the aws batch create-compute-environment / create-job-queue commands from §8,
+# with launchTemplate.version set to your corrected version's literal number.
 ```
 
 This matches `aws.config`:
@@ -540,6 +583,10 @@ aws batch create-job-queue \
   --priority 1 \
   --compute-environment-order order=1,computeEnvironment=mapped-spot-ce
 ```
+
+If `describe-compute-environments` shows `status: INVALID` afterward, it's almost
+certainly the Launch Template's `UserData` format — see §6's troubleshooting note for
+the fix, which (importantly) is delete-and-recreate here, not an in-place update.
 
 **On Windows PowerShell**, passing that JSON inline to `--compute-resources` doesn't work
 the same way — PowerShell's argument marshaling to native executables strips the quotes
