@@ -30,9 +30,10 @@ every `nextflow run` invocation.
 - **EC2 Spot-backed AWS Batch, not Fargate.** Nextflow's classic `awsbatch` executor
   stages files to/from S3 by shelling out to the `aws` CLI *inside every job container*.
   With an EC2-backed compute environment you can install the CLI once, on the host, via
-  a Launch Template, and bind-mount it into every container (`aws.batch.cliPath` /
-  `aws.batch.volumes` in `aws.config`) — none of the ~20 existing task images need to be
-  rebuilt. Fargate has no host to bind-mount from, so it would require baking the AWS
+  a Launch Template, and Nextflow bind-mounts it into every container automatically
+  (`aws.batch.cliPath` in `aws.config` — Nextflow derives the mount from this, no separate
+  `aws.batch.volumes` needed; see §6 for a duplicate-mount error this caused when both
+  were set) — none of the ~20 existing task images need to be rebuilt. Fargate has no host to bind-mount from, so it would require baking the AWS
   CLI into every image instead. EC2 Spot is also simply cheaper for this workload
   (nothing here is a poor Spot candidate — bacterial genomes are small).
 - **Docker images pulled directly from their public registries** (quay.io/biocontainers,
@@ -436,8 +437,16 @@ This matches `aws.config`:
 
 ```groovy
 aws.batch.cliPath = '/usr/local/aws-cli/bin/aws'   // path inside the job container
-aws.batch.volumes = '/usr/local/aws-cli'           // bind-mounted from the host
 ```
+
+**Don't also set `aws.batch.volumes` to the same path** — Nextflow automatically
+bind-mounts `cliPath`'s parent directory from the host into every container; an
+additional explicit `volumes` entry for that same path creates two mount points with the
+same `containerPath`, which fails at job-submission time with `containerPath values
+aren't unique across mountPoints` (opaque — doesn't mention "volumes" or "duplicate" at
+all). Hit and fixed against a live account; `aws.config` no longer sets `volumes`. Use
+`aws.batch.volumes` only for genuinely *additional* host paths unrelated to the CLI
+installation, if you ever need one.
 
 ---
 
@@ -694,7 +703,7 @@ management, if you prefer a managed IDE-style environment over raw EC2.
 
 Everything above is wired together through:
 
-- `aws.config` (repo root) — region, `aws.batch.cliPath`/`volumes`/`jobRole`, queue name,
+- `aws.config` (repo root) — region, `aws.batch.cliPath`/`jobRole`, queue name,
   and per-process cpu/memory/retry tuning.
 - Each module's `nextflow.config` — a `profiles { standard { ... } awsbatch { includeConfig "${projectDir}/../aws.config" } }` block. `standard` (local Docker) is Nextflow's
   built-in default when no `-profile` is given, so nothing changes for local runs.
