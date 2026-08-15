@@ -53,6 +53,18 @@ process FORMAT_METADATA {
 }
 
 workflow {
+    // Registered here, not as a top-level `workflow.onComplete { }` statement --
+    // Nextflow 26.x rejects that too, the same as any other bare top-level statement.
+    workflow.onComplete {
+        def logPattern = ~/\.nextflow\.log\.\d+/
+        new File('.').listFiles().findAll { it.name ==~ logPattern }.each { it.delete() }
+        // delete the tmp directory
+        def tmpDir = new File('tmp')
+        if (tmpDir.exists()) {
+            tmpDir.deleteDir()
+        }
+    }
+
     if ( !params.organism || !params.outdir ) {
         error "You must provide both --organism and --outdir parameters."
     }
@@ -71,15 +83,4 @@ workflow {
         (params.strain ?: '')
     )
 
-}
-
-// Add an onComplete event handler to always delete rotated Nextflow log files
-workflow.onComplete {
-    def logPattern = ~/\.nextflow\.log\.\d+/  
-    new File('.').listFiles().findAll { it.name ==~ logPattern }.each { it.delete() }
-    // delete the tmp directory
-    def tmpDir = new File('tmp')
-    if (tmpDir.exists()) {
-        tmpDir.deleteDir()
-    }
 }

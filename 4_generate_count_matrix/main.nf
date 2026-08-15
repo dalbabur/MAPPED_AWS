@@ -1143,6 +1143,13 @@ EOF
 // Main workflow
 //
 workflow {
+    // Registered here, not as a top-level `workflow.onComplete { }` statement --
+    // Nextflow 26.x rejects that too, the same as any other bare top-level statement.
+    workflow.onComplete {
+        def logPattern = ~/\.nextflow\.log\.\d+/
+        new File('.').listFiles().findAll { it.name ==~ logPattern }.each { it.delete() }
+    }
+
     if ( ! params.outdir )    error "Please provide --outdir"
 
     // Auto-detect reference genome and GFF in seqFiles/ref_genome under outdir.
@@ -1385,10 +1392,4 @@ workflow {
         log_tpm_norm_ch,
         file("${params.outdir}/samplesheet/samplesheet_download.csv")
     )
-}
-
-// Add an onComplete event handler to always delete rotated Nextflow log files
-workflow.onComplete {
-    def logPattern = ~/\.nextflow\.log\.\d+/  
-    new File('.').listFiles().findAll { it.name ==~ logPattern }.each { it.delete() }
 }

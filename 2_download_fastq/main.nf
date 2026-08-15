@@ -24,6 +24,13 @@ process CLEAN_NEXTFLOW_LOG {
 workflow {
 
     main:
+    // Registered here, not as a top-level `workflow.onComplete { }` statement --
+    // Nextflow 26.x rejects that too, the same as any other bare top-level statement.
+    workflow.onComplete {
+        def logPattern = ~/\.nextflow\.log\.\d+/
+        new File('.').listFiles().findAll { it.name ==~ logPattern }.each { it.delete() }
+    }
+
     // Make Python scripts in bin folder executable (moved here, not top-level script
     // scope -- Nextflow 26.x rejects bare statements outside a process/workflow/function)
     "chmod +x ${projectDir}/bin/sra_ids_to_runinfo.py".execute().waitFor()
@@ -136,15 +143,4 @@ workflow {
         .collectFile(name:'samplesheet_download.csv', storeDir: "${params.outdir}/samplesheet")
         .set { ch_samplesheet }
     }
-
-    emit:
-    samplesheet     = ch_samplesheet
-    sra_metadata    = ch_sra_metadata
-    versions        = ch_versions.unique()
-}
-
-// Add an onComplete event handler to always delete rotated Nextflow log files
-workflow.onComplete {
-    def logPattern = ~/\.nextflow\.log\.\d+/  
-    new File('.').listFiles().findAll { it.name ==~ logPattern }.each { it.delete() }
 }

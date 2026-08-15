@@ -3,6 +3,13 @@
 // Workflow to download a reference genome from NCBI and save to outdir
 
 workflow {
+    // Registered here, not as a top-level `workflow.onComplete { }` statement --
+    // Nextflow 26.x rejects that too, the same as any other bare top-level statement.
+    workflow.onComplete {
+        def logPattern = ~/\.nextflow\.log\.\d+/
+        new File('.').listFiles().findAll { it.name ==~ logPattern }.each { it.delete() }
+    }
+
     if (params.ref_accession) {
         // If ref_accession is provided, use it directly
         DOWNLOAD_REFERENCE_BY_ACCESSION(params.ref_accession)
@@ -200,10 +207,4 @@ process DOWNLOAD_REFERENCE_BY_ACCESSION {
     # Cleanup
     rm -rf tmp ref.zip
     """
-}
-
-// Add an onComplete event handler to always delete rotated Nextflow log files
-workflow.onComplete {
-    def logPattern = ~/\.nextflow\.log\.\d+/  
-    new File('.').listFiles().findAll { it.name ==~ logPattern }.each { it.delete() }
 }
