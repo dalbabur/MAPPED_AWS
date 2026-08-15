@@ -2,7 +2,10 @@ process SRA_TO_SAMPLESHEET {
     tag "$meta.id"
     errorStrategy 'ignore'
 
-    executor 'local'
+    // No local-filesystem work needed here (just two `echo`s), but AWS Batch requires
+    // every job to run in a container regardless -- reusing the image already pulled by
+    // sibling processes in this module avoids an extra image on the compute environment.
+    container 'quay.io/biocontainers/biopython:1.79'
     memory 100.MB
 
     input:
