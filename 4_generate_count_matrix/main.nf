@@ -61,7 +61,14 @@ process FASTQC {
     container 'quay.io/biocontainers/fastqc:0.12.1--hdfd78af_0'
     publishDir "${params.outdir}/fastqc", mode: 'copy'
     cpus 4
-    maxForks { (params.cpu / 4) as Integer }
+    // Plain expression, not a maxForks { ... } closure -- unlike cpus/memory/
+    // errorStrategy, maxForks doesn't evaluate a closure's return value here; it compares
+    // the closure object itself against an Integer, crashing with "Cannot compare
+    // Main$_runScript_closure... with ... java.lang.Integer" the instant the process is
+    // invoked. params.cpu is already fully resolved by the time processes are defined, so
+    // a plain expression (evaluated once, like sibling modules' `maxForks params.x ?: y`)
+    // works fine and needs no per-task re-evaluation anyway.
+    maxForks( (params.cpu / 4) as Integer )
     errorStrategy 'ignore'
 
     input:
@@ -99,7 +106,7 @@ process TRIMGALORE {
     container 'quay.io/biocontainers/trim-galore:0.6.9--hdfd78af_0'
     publishDir "${params.outdir}/trimmed", mode: 'copy'
     cpus 4
-    maxForks { (params.cpu / 4) as Integer }
+    maxForks( (params.cpu / 4) as Integer )
     errorStrategy 'ignore'
 
     input:
@@ -140,7 +147,7 @@ process SALMON_QUANT {
     container 'quay.io/biocontainers/salmon:1.10.3--h45fbf2d_4'
     publishDir "${params.outdir}/salmon", mode: 'copy'
     cpus 4
-    maxForks { (params.cpu / 4) as Integer }
+    maxForks( (params.cpu / 4) as Integer )
     errorStrategy 'ignore'
 
     input:
