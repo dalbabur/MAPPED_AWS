@@ -467,6 +467,19 @@ path `aws.config` expects (`/usr/local/aws-cli`), and bind-mount it into every c
 This also increases the root EBS volume — default sizes are too small once you're
 downloading FASTQ + a Salmon index + a reference genome per instance.
 
+**The AWS CLI v2 installer's real default layout doesn't match the flat path
+`aws.config`'s `cliPath` expects** — `./aws/install` actually creates
+`/usr/local/aws-cli/v2/<version>/bin/aws`, with `/usr/local/aws-cli/v2/current` symlinked
+to the versioned directory and `/usr/local/bin/aws` symlinked to that. There's no literal
+`/usr/local/aws-cli/bin/aws`. Running a job with `cliPath` pointing at that nonexistent
+flat path fails confusingly *after* everything else works — the instance launches, the
+job container starts, and only the actual script command fails, with
+`bash: /usr/local/aws-cli/bin/aws: No such file or directory`. Add a compatibility
+symlink in the UserData so the simple flat path `cliPath` uses actually resolves, rather
+than changing `cliPath` to chase the versioned/symlinked real path (simpler, and avoids
+relying on Nextflow's auto-derived container mount correctly following a multi-level
+symlink chain):
+
 **UserData must be MIME multipart, not a plain script** — a bare `#!/bin/bash` script
 works for standalone EC2 instances, but AWS Batch's compute environment validation
 rejects it outright with `CLIENT_ERROR - Launch Template UserData is not MIME multipart
@@ -489,6 +502,8 @@ cd /tmp
 curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
 unzip -q awscliv2.zip
 ./aws/install
+mkdir -p /usr/local/aws-cli/bin
+ln -sf /usr/local/aws-cli/v2/current/bin/aws /usr/local/aws-cli/bin/aws
 
 --===============MAPPEDBOUNDARY==--
 EOF
