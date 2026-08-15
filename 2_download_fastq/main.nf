@@ -5,6 +5,7 @@
 */
 
 include { SRA_FASTQ_FTP           } from './modules/sra_fastq_ftp'
+include { SRA_FASTQ_AWSODP        } from './modules/sra_fastq_awsodp'
 include { SRA_IDS_TO_RUNINFO      } from './modules/sra_ids_to_runinfo'
 include { SRA_RUNINFO_TO_FTP      } from './modules/sra_runinfo_to_ftp'
 include { SRA_TO_SAMPLESHEET      } from './modules/sra_to_samplesheet'
@@ -102,6 +103,17 @@ workflow {
             ch_sra_reads.ftp
         )
         ch_versions = ch_versions.mix(SRA_FASTQ_FTP.out.versions.first())
+
+        //
+        // MODULE: Otherwise (the default), fetch the run directly from NCBI SRA's AWS Open
+        // Data buckets (s3://sra-pub-run-odp) and convert to FastQ with fasterq-dump. This
+        // is the default download_method ('sratools'); set --download_method ftp to use
+        // SRA_FASTQ_FTP above instead.
+        //
+        SRA_FASTQ_AWSODP (
+            ch_sra_reads.sratools
+        )
+        ch_versions = ch_versions.mix(SRA_FASTQ_AWSODP.out.versions.first())
 
     //
     // MODULE: Stage FastQ files downloaded by SRA together and auto-create a samplesheet

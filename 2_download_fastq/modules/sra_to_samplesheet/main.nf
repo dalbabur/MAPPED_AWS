@@ -19,14 +19,19 @@ process SRA_TO_SAMPLESHEET {
     def mclone = meta.clone()
     ['fastq_1','fastq_2','md5_1','md5_2','single_end'].each { mclone.remove(it) }
     def sampleId = meta.id.split('_')[0..-2].join('_')
-    def fastqDir = "${params.workdir}/seqFiles/fastq"
+    // Relative to params.outdir, matching SRA_FASTQ_FTP/SRA_FASTQ_AWSODP's shared
+    // publishDir ("${params.outdir}/seqFiles/fastq"). Previously built from
+    // params.workdir, a param that was never actually set (the real work-dir is passed
+    // via Nextflow's native -work-dir flag) -- this produced a leading-slash path that
+    // happened to self-correct via "//" collapsing on a local POSIX filesystem, but not
+    // on S3, where "//" is not collapsed.
     def baseMap = [ sample: sampleId ]
     if (meta.single_end.toString().toBoolean()) {
-        baseMap.fastq_1 = "${fastqDir}/${meta.id}.fastq.gz"
+        baseMap.fastq_1 = "seqFiles/fastq/${meta.id}.fastq.gz"
         baseMap.fastq_2 = ""
     } else {
-        baseMap.fastq_1 = "${fastqDir}/${meta.id}_1.fastq.gz"
-        baseMap.fastq_2 = "${fastqDir}/${meta.id}_2.fastq.gz"
+        baseMap.fastq_1 = "seqFiles/fastq/${meta.id}_1.fastq.gz"
+        baseMap.fastq_2 = "seqFiles/fastq/${meta.id}_2.fastq.gz"
     }
     def pipeline_map = baseMap + mclone
     def header = pipeline_map.keySet().collect{ "\"${it}\"" }.join(',')

@@ -61,7 +61,9 @@ workflow {
 
     raw_metadata = FETCH_METADATA( params.organism )
 
-    clean_script = file( 'bin/clean_metadata_file.py' )
+    // Resolved relative to this script's own directory (projectDir), not the launch/CWD,
+    // so this works regardless of what directory `nextflow run` is invoked from.
+    clean_script = file( "${projectDir}/bin/clean_metadata_file.py" )
 
     ( cleaned_metadata, sample_ids ) = FORMAT_METADATA(
         raw_metadata,

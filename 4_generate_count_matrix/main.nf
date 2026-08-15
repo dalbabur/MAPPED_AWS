@@ -10,17 +10,20 @@ params.cpu = params.cpu ?: 20
 def threads_per_task = 4
 def max_parallel = (params.cpu / threads_per_task) as Integer
 
-// Auto-detect reference genome and GFF in seqFiles/ref_genome under outdir
-def refDir = new File("${params.outdir}/seqFiles/ref_genome")
+// Auto-detect reference genome and GFF in seqFiles/ref_genome under outdir.
+// Uses Nextflow's file()/Path API (not java.io.File) so this also works when
+// params.outdir is an s3:// URI, not just a local path.
+def refDir = file("${params.outdir}/seqFiles/ref_genome")
 if ( ! refDir.exists() ) error "Reference genome directory not found: ${refDir}"
-def fastaFiles = refDir.list().findAll { it.endsWith('.fna') || it.endsWith('.fa') }
+def refDirFiles = refDir.listFiles()
+def fastaFiles = refDirFiles.findAll { it.name.endsWith('.fna') || it.name.endsWith('.fa') }
 if ( fastaFiles.size() == 0 ) error "No FASTA (.fna/.fa) file found in ${refDir}"
-if ( fastaFiles.size() > 1 ) error "Multiple FASTA files found in ${refDir}: ${fastaFiles}"
-params.ref_genome = "${refDir}/${fastaFiles[0]}"
-def gffFiles = refDir.list().findAll { it.endsWith('.gff') }
+if ( fastaFiles.size() > 1 ) error "Multiple FASTA files found in ${refDir}: ${fastaFiles*.name}"
+params.ref_genome = fastaFiles[0].toUriString()
+def gffFiles = refDirFiles.findAll { it.name.endsWith('.gff') }
 if ( gffFiles.size() == 0 ) error "No GFF (.gff) file found in ${refDir}"
-if ( gffFiles.size() > 1 ) error "Multiple GFF files found in ${refDir}: ${gffFiles}"
-params.ref_gff = "${refDir}/${gffFiles[0]}"
+if ( gffFiles.size() > 1 ) error "Multiple GFF files found in ${refDir}: ${gffFiles*.name}"
+params.ref_gff = gffFiles[0].toUriString()
 
 // Process: extract CDS
 //
@@ -882,6 +885,7 @@ process DATA_VALIDATION {
       path log_tpm_matrix
       path counts_matrix
       path log_tpm_norm_matrix
+      path samplesheet_download_file, stageAs: 'samplesheet_download_orig.csv'
 
     output:
       path 'samplesheet.csv', emit: samplesheet
@@ -902,8 +906,11 @@ print("=== DATA_VALIDATION ===")
 print("Ensuring samplesheet 'sample' column matches expression matrix columns exactly...")
 print("Also checking and fixing gene ID prefixes...")
 
-# First, process samplesheet_download.csv if it exists
-samplesheet_download_path = "${params.outdir}/samplesheet/samplesheet_download.csv"
+# First, process samplesheet_download.csv if it exists. Read from the file Nextflow
+# staged into this task's working directory (declared as an input above) rather than
+# a raw params.outdir path -- the raw path only resolves for a local filesystem outdir,
+# not an s3:// one.
+samplesheet_download_path = "samplesheet_download_orig.csv"
 if os.path.exists(samplesheet_download_path):
     print("\\n=== PROCESSING SAMPLESHEET_DOWNLOAD.CSV ===")
     try:
@@ -1369,7 +1376,8 @@ workflow {
         filtered_results.tpm,
         filtered_results.log_tpm,
         filtered_results.counts,
-        log_tpm_norm_ch
+        log_tpm_norm_ch,
+        file("${params.outdir}/samplesheet/samplesheet_download.csv")
     )
 }
 

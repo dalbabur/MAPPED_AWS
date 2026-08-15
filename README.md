@@ -24,11 +24,16 @@ The pipeline is designed to handle large-scale datasets with built-in error hand
 - **Docker integration**: No manual dependency installation required
 - **Comprehensive quality control**: FastQC and MultiQC reports included
 - **Strain filtering**: Optionally restrict samples by strain token in ScientificName
+- **AWS-ready**: Run on AWS Batch against S3, with FASTQ sourced directly from NCBI SRA's
+  AWS Open Data buckets instead of ENA's FTP mirror — see [Running on AWS](#running-on-aws)
 
 ## Prerequisites
 
 - **[Nextflow](https://www.nextflow.io/)** (version 21.04.0 or later)
 - **[Docker](https://www.docker.com/)** (version 20.10 or later)
+
+Additionally, to run on AWS: an AWS account and the environment described in
+[AWS_SETUP.md](AWS_SETUP.md) (AWS Batch compute environment, S3 buckets, IAM roles).
 
 ## Installation
 
@@ -100,6 +105,25 @@ To automatically clean up intermediate files after successful completion:
     --clean-mode
 ```
 
+## Running on AWS
+
+Pass `s3://` URIs for `--outdir`/`--workdir` and the pipeline runs on AWS Batch instead
+of your local machine, pulling FASTQ directly from NCBI SRA's AWS Open Data buckets
+(`s3://sra-pub-run-odp`) instead of ENA's FTP mirror:
+
+```bash
+./run_MAPPED.sh \
+    --organism "Escherichia coli" \
+    --outdir s3://my-mapped-bucket/results \
+    --workdir s3://my-mapped-bucket/work \
+    --library_layout paired \
+    --cpu 16
+```
+
+This requires the AWS environment (IAM roles, VPC, S3 buckets, AWS Batch compute
+environment/queue) described in **[AWS_SETUP.md](AWS_SETUP.md)** to already exist.
+`--clean-mode` is local-only (use an S3 Lifecycle rule instead — see AWS_SETUP.md).
+
 ## Pipeline Modules
 
 ### 1. Download Metadata (Module 1)
@@ -108,7 +132,9 @@ To automatically clean up intermediate files after successful completion:
 - Generates formatted metadata files for downstream processing
 
 ### 2. Download FASTQ (Module 2)
-- Downloads raw sequencing data
+- Downloads raw sequencing data — by default directly from NCBI SRA's AWS Open Data
+  buckets (`s3://sra-pub-run-odp`) via `sra-tools`; falls back to ENA's FTP mirror if
+  `--download_method ftp` is set
 - Validates downloaded files
 - Creates a samplesheet for downstream analysis
 
