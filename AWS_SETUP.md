@@ -556,11 +556,35 @@ is in the actual error text, which you'll only see by pulling the job's CloudWat
 against log group `/aws/batch/job`); Nextflow's own log only shows a generic "container
 exited"/exit code 127.
 
-The fix: copy the host's `libz.so.1` into the same directory as the AWS CLI's real
-binary. The installer's `bin/aws` is a chain of symlinks that ultimately resolves to
-`v2/<version>/dist/aws` — the PyInstaller-bundled binary uses an `$ORIGIN`-relative rpath,
-so any shared library dropped in that same `dist/` directory is picked up automatically,
-no `LD_LIBRARY_PATH` or other config changes needed:
+**The fix is two parts, and the first alone doesn't work** — copying `libz.so.1` next to
+the real binary is necessary but not sufficient. The first attempt at this fix assumed the
+PyInstaller-bundled binary uses an `$ORIGIN`-relative rpath (so a same-directory library
+would be picked up automatically) — that assumption was wrong and shipped once, silently
+failing identically to the original bug. Checked directly against a live instance:
+`ldd` on the real `v2/<version>/dist/aws` binary resolves `libz.so.1 => /lib64/libz.so.1`
+— the *system* path — even with a copy of `libz.so.1` sitting right next to the binary in
+`dist/`. The binary carries no rpath/runpath at all; it relies entirely on the default
+system library search path, which is exactly what's missing inside a minimal container.
+Verified by reproducing the exact bind-mount scenario with `docker run -v
+/usr/local/aws-cli:/usr/local/aws-cli:ro quay.io/biocontainers/biopython:1.79
+/usr/local/aws-cli/bin/aws --version` on a standalone EC2 instance built from the same
+launch template (outside of Batch, for fast iteration) — this reproduced the failure
+in seconds and confirmed the fix before redeploying.
+
+The actual fix: still copy `libz.so.1` into the `dist/` directory (so *something* is
+there to find), but also point `LD_LIBRARY_PATH` at that directory whenever `aws` runs.
+Since `cliPath` needs to remain a stable flat path but the real binary lives under a
+version-numbered directory, make `/usr/local/aws-cli/bin/aws` a small wrapper *script*
+(not a symlink) that exports `LD_LIBRARY_PATH` and then `exec`s the real binary:
+
+**Don't write the wrapper via `> /usr/local/aws-cli/bin/aws` if that path is already a
+symlink from a previous attempt** — shell output redirection follows symlinks and writes
+through to whatever they point at, so `printf ... > bin/aws` silently overwrote the *real*
+AWS CLI binary with the wrapper's own text on one contaminated diagnostic instance,
+producing an infinite self-exec loop the moment it ran. Harmless here because the
+UserData always starts from a fresh, non-symlinked `bin/` directory on every fresh
+instance launch — this only bites you if you're hand-patching an already-provisioned
+host over SSM, in which case `rm -f`/`unlink` the old symlink first.
 
 ```bash
 cat > mapped-userdata.sh <<'EOF'
@@ -581,10 +605,12 @@ cd /tmp
 curl -fsSL --max-time 60 "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
 unzip -o -q awscliv2.zip
 ./aws/install
-mkdir -p /usr/local/aws-cli/bin
-ln -sf /usr/local/aws-cli/v2/current/bin/aws /usr/local/aws-cli/bin/aws
-AWS_DIST_DIR=$(dirname $(readlink -f /usr/local/aws-cli/bin/aws))
+REAL_AWS=$(readlink -f /usr/local/aws-cli/v2/current/bin/aws)
+AWS_DIST_DIR=$(dirname "$REAL_AWS")
 cp -n /usr/lib64/libz.so.1 "$AWS_DIST_DIR/" || true
+mkdir -p /usr/local/aws-cli/bin
+printf '#!/bin/bash\nexport LD_LIBRARY_PATH=%q\nexec %q "$@"\n' "$AWS_DIST_DIR" "$REAL_AWS" > /usr/local/aws-cli/bin/aws
+chmod +x /usr/local/aws-cli/bin/aws
 /usr/local/aws-cli/bin/aws --version
 
 --===============MAPPEDBOUNDARY==--
@@ -633,6 +659,28 @@ guessing further stopped being productive:
    send-command` straight to `cat /var/log/mapped-userdata.log` — this is what actually
    showed the `curl-minimal` conflict error verbatim, immediately, after three prior
    fixes based on plausible-but-wrong guesses.)
+
+**For iterating on a fix itself (as opposed to diagnosing what's broken), skip Batch
+entirely** — launch a standalone EC2 instance directly from the same launch template with
+`aws ec2 run-instances --launch-template LaunchTemplateName=mapped-batch-lt,Version=<n>`
+(needs an explicit `--image-id`, since Batch normally supplies the AMI dynamically via
+`ec2Configuration` and the launch template itself doesn't pin one — grab the current
+ECS-optimized AL2023 AMI with `aws ssm get-parameter --name
+/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended`; also pass
+`--iam-instance-profile Name=MappedBatchInstanceProfile` for SSM access, and override the
+subnet via `--network-interfaces DeviceIndex=0,SubnetId=<id>` rather than a top-level
+`--subnet-id`, which conflicts with the launch template's own `NetworkInterfaces` block).
+This gets you a live, SSM-reachable instance in under a minute, running the exact same
+UserData/AMI/IAM role a real worker would get, with no dependency on job scheduling timing
+or a race against Spot scale-down — you can `ssm send-command` to hand-patch and re-test a
+fix repeatedly on the same instance before committing it to a new launch template version.
+This is also the only practical way to reproduce a job-container-specific failure (like
+the `libz.so.1` issue below) directly: `docker run --rm -v
+/usr/local/aws-cli:/usr/local/aws-cli:ro <image> /usr/local/aws-cli/bin/aws --version`
+replicates AWS Batch's exact bind-mount behavior in seconds, against the real container
+image, without submitting a single Batch job. Terminate the instance when done
+(`aws ec2 terminate-instances`) — it's not part of the compute environment and won't be
+cleaned up automatically.
 
 **If you fix the UserData on an *existing* launch template used by a compute
 environment already stuck `INVALID` with this reason, updating the template alone often
