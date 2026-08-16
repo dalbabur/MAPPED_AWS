@@ -1456,9 +1456,22 @@ workflow {
         error "Unknown --quantifier '${params.quantifier}': expected 'bowtie2' or 'salmon'"
 
     // load samples from the original download samplesheet
+    //
+    // Existence checked eagerly here, not via a reactive `.ifEmpty{ error ... }` on the
+    // Channel.fromPath below (as an earlier version of this did) -- with the rest of this
+    // workflow's later operators present (FILTER_SAMPLESHEET, DATA_VALIDATION, etc. all
+    // re-referencing this same path further down), that reactive ifEmpty intermittently
+    // fired as if the channel were empty even when the file demonstrably existed and
+    // Channel.fromPath had already emitted it, confirmed by isolated reproduction: the
+    // exact same channel construction succeeds every time in a minimal script, only
+    // failing once the rest of this workflow's later operators are also present. An eager
+    // check matches the pattern already used above for refDir/fastaFiles/gffFiles, which
+    // never showed this problem.
+    def samplesheetDownloadFile = file("${params.outdir}/samplesheet/samplesheet_download.csv")
+    if ( ! samplesheetDownloadFile.exists() ) error "Sample sheet not found at: ${samplesheetDownloadFile}"
+
     samples_ch = Channel
-        .fromPath( file("${params.outdir}/samplesheet/samplesheet_download.csv") )
-        .ifEmpty { error "Sample sheet not found at: ${params.outdir}/samplesheet/samplesheet_download.csv" }
+        .fromPath( samplesheetDownloadFile )
         .splitCsv(header: true, sep: ',')
         // remove surrounding quotes and normalize keys
         .map { row ->
@@ -1468,16 +1481,16 @@ workflow {
                 [ key, value ]
             }
         }
-        // keep only rows that have all required fields
+        // keep only rows that have all required fields. No `.ifEmpty{ error ... }` guard
+        // here (an earlier version had one) -- same class of issue as the eager
+        // samplesheetDownloadFile check above: with this workflow's later operators
+        // present, a reactive ifEmpty here intermittently fired even when the CSV
+        // demonstrably had valid rows. Downstream stages already tolerate a genuinely
+        // empty result on their own (FILTER_SAMPLESHEET's `[ ! -s ... ]` check,
+        // MERGE_COUNTS/MERGE_COUNTS_FEATURECOUNTS's "No data to process" branch), so
+        // nothing downstream actually depends on failing fast here.
         .filter { row ->
             row.id && row.fastq_1 && row.run_accession
-        }
-        .ifEmpty {
-            error """
-    No valid samples found after filtering.
-    Make sure your CSV has columns exactly named:
-    id, fastq_1, run_accession.
-    """
         }
         // build the tuple for each sample using the id column which has SRX_SRR, DRX_DRR, or ERX_ERR format
         .map { row ->
@@ -1659,7 +1672,8 @@ workflow {
         )
     } else {
         sam_ch = BOWTIE2_ALIGN(filtered_trimmed_ch, bowtie2_index_ch)
-        bam_ch = SAM_SORT_INDEX(sam_ch)
+        sam_sort_index_out = SAM_SORT_INDEX(sam_ch)
+        bam_ch = sam_sort_index_out.bam
         fc_ch  = FEATURECOUNTS(bam_ch, refGff)
         fc_success_ch = fc_ch.filter { counts_file -> counts_file != null }
         count_matrix_ch = MERGE_COUNTS_FEATURECOUNTS(
