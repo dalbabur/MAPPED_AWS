@@ -142,26 +142,32 @@ process DOWNLOAD_REFERENCE_BY_ACCESSION {
 
     script:
     """
-    # Validate accession format
-    if [[ ! "${accession}" =~ ^GCA_[0-9]+\\.[0-9]+\$ ]]; then
+    # Validate accession format -- GCA_ (GenBank) or GCF_ (RefSeq) are both valid NCBI
+    # assembly accession prefixes. RefSeq/GCF is usually the better choice when both
+    # exist for the same assembly: it carries NCBI's own PGAP annotation, whereas the
+    # paired GenBank/GCA submission frequently lacks GFF3/protein files entirely (the
+    # same gap DOWNLOAD_REFERENCE's own auto-selection logic was fixed to avoid).
+    if [[ ! "${accession}" =~ ^GC[AF]_[0-9]+\\.[0-9]+\$ ]]; then
         echo "ERROR: Invalid accession format: ${accession}"
-        echo "Expected format: GCA_XXXXXXXXX.Y (e.g., GCA_008931305.1)"
+        echo "Expected format: GCA_XXXXXXXXX.Y or GCF_XXXXXXXXX.Y (e.g., GCF_000007565.2)"
         exit 1
     fi
-    
+
     echo "Downloading genome for accession: ${accession}"
-    
-    # Download the specific GenBank accession
+
+    # Download the specific accession
     datasets download genome accession "${accession}" --include gff3,protein,genome --filename ref.zip
-    
+
     # Extract and organize files
     unzip ref.zip -d tmp
-    
-    # Find the GCA directory
-    gca_dir=\$(find tmp/ncbi_dataset/data -mindepth 1 -maxdepth 1 -type d -name "GCA_*" | head -n1)
-    
+
+    # Find the downloaded assembly directory -- named exactly after the accession
+    # requested, so match it directly rather than assuming a GCA_ prefix (which silently
+    # found nothing at all for a GCF_ accession).
+    gca_dir=\$(find tmp/ncbi_dataset/data -mindepth 1 -maxdepth 1 -type d -name "${accession}" | head -n1)
+
     if [ -z "\$gca_dir" ]; then
-        echo "Error: GenBank assembly directory not found after download"
+        echo "Error: Assembly directory not found after download"
         exit 1
     fi
     
