@@ -30,10 +30,19 @@ process SRA_FASTQ_AWSODP {
 
     fasterq-dump ./${run_accession}.sra --split-files --threads ${task.cpus} --outdir .
 
+    # --split-files always names output(s) after whichever read-types actually contain
+    # data -- for paired-end runs that's _1 and _2, but for a single-end run whose SRA
+    # archive still records a second, entirely 0-length technical read (common for some
+    # library preps), fasterq-dump drops that empty side silently and writes only _1,
+    # never creating _2 at all. Requiring both to exist misreads a perfectly good
+    # single-end result as "no output produced".
     if [ -f ${run_accession}_1.fastq ] && [ -f ${run_accession}_2.fastq ]; then
         mv ${run_accession}_1.fastq ${meta.id}_1.fastq
         mv ${run_accession}_2.fastq ${meta.id}_2.fastq
         gzip ${meta.id}_1.fastq ${meta.id}_2.fastq
+    elif [ -f ${run_accession}_1.fastq ]; then
+        mv ${run_accession}_1.fastq ${meta.id}.fastq
+        gzip ${meta.id}.fastq
     elif [ -f ${run_accession}.fastq ]; then
         mv ${run_accession}.fastq ${meta.id}.fastq
         gzip ${meta.id}.fastq
