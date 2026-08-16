@@ -4,6 +4,16 @@
 params.outdir    = null
 params.cpu = params.cpu ?: 20
 
+// --quantifier selects the gene-quantification method:
+//   'bowtie2' (default) -- Bowtie2 aligns reads to the whole genome, then
+//     featureCounts assigns them to every gene type in the GFF (protein-coding,
+//     tRNA, rRNA, ncRNA -- anything with a 'gene' feature), not just CDS. This
+//     gives visibility into non-coding-RNA read fraction that the CDS-only
+//     path structurally cannot see (see 4_generate_count_matrix/README.md).
+//   'salmon' -- the original CDS-only pseudo-alignment path (EXTRACT_CDS +
+//     SALMON_INDEX + SALMON_QUANT), kept as an opt-in.
+params.quantifier = params.quantifier ?: 'bowtie2'
+
 // Note: the --outdir requiredness check and the reference-genome/GFF auto-detection
 // that used to live here (as top-level `if`/`def` statements) now live at the top of
 // workflow{} below instead -- Nextflow (26.x+) rejects bare statements mixed with
@@ -178,6 +188,113 @@ process SALMON_QUANT {
 }
 
 //
+// Process: build Bowtie2 index from the whole reference genome (not CDS-only)
+//
+process BOWTIE2_BUILD {
+    tag 'bowtie2_build'
+    container 'quay.io/biocontainers/bowtie2:2.5.5--ha27dd3b_0'
+    errorStrategy 'ignore'
+
+    input:
+      path genome
+
+    output:
+      path 'bowtie2_index', optional: true
+
+    script:
+    """
+    mkdir -p bowtie2_index
+    bowtie2-build --threads 2 ${genome} bowtie2_index/index
+    """
+}
+
+//
+// Process: align trimmed reads to the whole genome with Bowtie2
+//
+process BOWTIE2_ALIGN {
+    tag '$sample'
+    container 'quay.io/biocontainers/bowtie2:2.5.5--ha27dd3b_0'
+    cpus 2
+    maxForks( (params.cpu as Integer).intdiv(4) )
+    errorStrategy 'ignore'
+
+    input:
+      tuple val(sample), path(reads)
+      path index
+
+    output:
+      tuple val(sample), path("${sample}.sam"), val(reads instanceof List && reads.size() == 2), optional: true, emit: sam
+
+    script:
+    def is_paired = reads instanceof List && reads.size() == 2
+    if (is_paired) {
+        """
+        bowtie2 -x ${index}/index -1 ${reads[0]} -2 ${reads[1]} -p 2 -S ${sample}.sam || true
+        if [ ! -s ${sample}.sam ]; then
+            echo "BOWTIE2_ALIGN failed for sample ${sample}" >&2
+        fi
+        """
+    } else {
+        def read_file = reads instanceof List ? reads[0] : reads
+        """
+        bowtie2 -x ${index}/index -U ${read_file} -p 2 -S ${sample}.sam || true
+        if [ ! -s ${sample}.sam ]; then
+            echo "BOWTIE2_ALIGN failed for sample ${sample}" >&2
+        fi
+        """
+    }
+}
+
+//
+// Process: coordinate-sort and index the Bowtie2 alignments
+//
+process SAM_SORT_INDEX {
+    tag '$sample'
+    container 'quay.io/biocontainers/samtools:1.24--h9dcdb79_1'
+    publishDir "${params.outdir}/bowtie2", mode: 'copy'
+    cpus 2
+    errorStrategy 'ignore'
+
+    input:
+      tuple val(sample), path(sam), val(is_paired)
+
+    output:
+      tuple val(sample), path("${sample}.sorted.bam"), val(is_paired), optional: true, emit: bam
+      path "${sample}.sorted.bam.bai", optional: true, emit: bai
+
+    script:
+    """
+    samtools sort -@ 2 -o ${sample}.sorted.bam ${sam}
+    samtools index ${sample}.sorted.bam
+    """
+}
+
+//
+// Process: assign aligned reads to genes -- every 'gene' feature in the GFF
+// (protein-coding, tRNA, rRNA, ncRNA), not just CDS -- grouped by locus_tag.
+//
+process FEATURECOUNTS {
+    tag '$sample'
+    container 'quay.io/biocontainers/subread:2.1.1--h577a1d6_0'
+    publishDir "${params.outdir}/featurecounts", mode: 'copy'
+    cpus 2
+    errorStrategy 'ignore'
+
+    input:
+      tuple val(sample), path(bam), val(is_paired)
+      path annotation
+
+    output:
+      path "${sample}_counts.txt", optional: true, emit: counts
+
+    script:
+    def pairFlag = is_paired ? '-p --countReadPairs' : ''
+    """
+    featureCounts -a ${annotation} -F GTF -t gene -g locus_tag ${pairFlag} -T 2 -o ${sample}_counts.txt ${bam}
+    """
+}
+
+//
 // Process: merge count matrices by experiment ID
 //
 process MERGE_COUNTS {
@@ -338,6 +455,153 @@ if gene_ids and final_counts:
                 f.write(f',{log_tpm:.6f}')
             f.write('\\n')
     
+    print(f"Generated matrices with {len(gene_ids)} genes and {len(sorted_experiments)} experiments")
+else:
+    print("No data to process - creating empty files")
+    with open('counts.csv', 'w') as f:
+        f.write('GeneID\\n')
+    with open('tpm.csv', 'w') as f:
+        f.write('GeneID\\n')
+    with open('log_tpm.csv', 'w') as f:
+        f.write('GeneID\\n')
+
+EOF
+    """
+}
+
+//
+// Process: merge featureCounts outputs by experiment ID (Bowtie2 path's
+// counterpart to MERGE_COUNTS -- same experiment-grouping/TPM logic, reading
+// featureCounts' "<sample>_counts.txt" format instead of Salmon's quant.sf)
+//
+process MERGE_COUNTS_FEATURECOUNTS {
+    publishDir "${params.outdir}/expression_matrices", mode: 'copy'
+    container 'felixlohmeier/pandas:1.3.3'
+    errorStrategy 'ignore'
+
+    input:
+      path count_files
+      path passed_samples_file
+
+    output:
+      path 'tpm.csv', optional: true
+      path 'log_tpm.csv', optional: true
+      path 'counts.csv', optional: true
+
+    script:
+    """
+    python3 - << 'EOF'
+import os
+import glob
+import pandas as pd
+import numpy as np
+from collections import defaultdict
+
+# Read passed sample IDs
+passed_sample_ids = set()
+if os.path.exists('${passed_samples_file}'):
+    with open('${passed_samples_file}', 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                passed_sample_ids.add(line)
+
+print(f"Found {len(passed_sample_ids)} passed sample IDs")
+
+# Find all featureCounts output files
+count_files = sorted(glob.glob('*_counts.txt'))
+print(f"Found {len(count_files)} featureCounts output files")
+
+# Group by experiment ID and collect data
+experiment_data = defaultdict(list)
+gene_ids = None
+gene_lengths = None
+
+for count_file in count_files:
+    sample_name = count_file[:-len('_counts.txt')]
+
+    # Extract experiment ID (everything before the first underscore)
+    # This handles SRX_SRR, DRX_DRR, and ERX_ERR patterns
+    experiment_id = sample_name.split('_')[0]
+
+    # Get base sample name (remove _val_1/_val_2 suffixes for paired-end or _trimmed for single-end)
+    base_sample_name = sample_name.replace('_val_1', '').replace('_val_2', '').replace('_trimmed', '')
+
+    # Only process samples from passed experiments
+    if base_sample_name not in passed_sample_ids:
+        print(f"Skipping {sample_name} (base sample {base_sample_name} not in passed samples)")
+        continue
+
+    # featureCounts output: a '# Program:featureCounts ...' comment line, then a
+    # header row (Geneid, Chr, Start, End, Strand, Length, <bam path>), then data.
+    # The last column's header is whatever BAM path was passed in, so select it
+    # by position rather than by name.
+    df = pd.read_csv(count_file, sep='\\t', comment='#')
+    count_col = df.columns[-1]
+
+    if gene_ids is None:
+        gene_ids = df['Geneid'].tolist()
+        gene_lengths = df['Length'].tolist()
+
+    experiment_data[experiment_id].append({
+        'sample': sample_name,
+        'base_sample': base_sample_name,
+        'counts': df[count_col].tolist(),
+    })
+
+print(f"Grouped into {len(experiment_data)} experiments")
+
+# Merge data by experiment, computing TPM from (possibly summed) raw counts --
+# featureCounts reports raw counts + gene length only, not TPM directly.
+final_counts = {}
+final_tpm = {}
+
+for experiment_id, runs in experiment_data.items():
+    if len(runs) == 1:
+        summed_counts = runs[0]['counts']
+    else:
+        print(f"Merging {len(runs)} runs for experiment {experiment_id}")
+        summed_counts = [0] * len(gene_ids)
+        for run in runs:
+            for i in range(len(gene_ids)):
+                summed_counts[i] += run['counts'][i]
+
+    rpk = [summed_counts[i] / gene_lengths[i] if gene_lengths[i] > 0 else 0 for i in range(len(gene_ids))]
+    scaling_factor = sum(rpk) / 1e6 if sum(rpk) > 0 else 1
+    tpm = [rpk[i] / scaling_factor if scaling_factor > 0 else 0 for i in range(len(gene_ids))]
+
+    final_counts[experiment_id] = summed_counts
+    final_tpm[experiment_id] = tpm
+
+# Create output matrices
+if gene_ids and final_counts:
+    sorted_experiments = sorted(final_counts.keys())
+
+    with open('counts.csv', 'w') as f:
+        f.write('GeneID,' + ','.join(sorted_experiments) + '\\n')
+        for i, gene_id in enumerate(gene_ids):
+            f.write(gene_id)
+            for exp_id in sorted_experiments:
+                f.write(f',{final_counts[exp_id][i]}')
+            f.write('\\n')
+
+    with open('tpm.csv', 'w') as f:
+        f.write('GeneID,' + ','.join(sorted_experiments) + '\\n')
+        for i, gene_id in enumerate(gene_ids):
+            f.write(gene_id)
+            for exp_id in sorted_experiments:
+                f.write(f',{final_tpm[exp_id][i]:.6f}')
+            f.write('\\n')
+
+    with open('log_tpm.csv', 'w') as f:
+        f.write('GeneID,' + ','.join(sorted_experiments) + '\\n')
+        for i, gene_id in enumerate(gene_ids):
+            f.write(gene_id)
+            for exp_id in sorted_experiments:
+                log_tpm = np.log2(final_tpm[exp_id][i] + 1)
+                f.write(f',{log_tpm:.6f}')
+            f.write('\\n')
+
     print(f"Generated matrices with {len(gene_ids)} genes and {len(sorted_experiments)} experiments")
 else:
     print("No data to process - creating empty files")
@@ -1188,6 +1452,9 @@ workflow {
     if ( gffFiles.size() > 1 ) error "Multiple GFF files found in ${refDir}: ${gffFiles*.name}"
     def refGff = gffFiles[0]
 
+    if ( params.quantifier != 'bowtie2' && params.quantifier != 'salmon' )
+        error "Unknown --quantifier '${params.quantifier}': expected 'bowtie2' or 'salmon'"
+
     // load samples from the original download samplesheet
     samples_ch = Channel
         .fromPath( file("${params.outdir}/samplesheet/samplesheet_download.csv") )
@@ -1221,9 +1488,13 @@ workflow {
             tuple(row.id, reads)
         }
 
-    // build index
-    cds_fa_ch       = EXTRACT_CDS( refGenome, refGff )
-    salmon_index_ch = SALMON_INDEX(cds_fa_ch)
+    // build index for whichever quantifier was selected
+    if ( params.quantifier == 'salmon' ) {
+        cds_fa_ch       = EXTRACT_CDS( refGenome, refGff )
+        salmon_index_ch = SALMON_INDEX(cds_fa_ch)
+    } else {
+        bowtie2_index_ch = BOWTIE2_BUILD( refGenome )
+    }
 
     // trim
     trimmed_ch = TRIMGALORE(samples_ch)
@@ -1377,20 +1648,25 @@ workflow {
         .join(passed_samples_ch)
         .map { base_sample_id, sample_tuple, passed_sample -> sample_tuple }
 
-    // Run Salmon quantification only on QC-passed samples
-    quant_ch = SALMON_QUANT(filtered_trimmed_ch, salmon_index_ch)
-
-    // Filter successful Salmon outputs
-    quant_success_ch = quant_ch
-        .filter { quant_dir ->
-            quant_dir != null
-        }
-
-    // merge count matrices - wait for both quantification and samplesheet filtering
-    count_matrix_ch = MERGE_COUNTS( 
-        quant_success_ch.collect(), 
-        passed_ch
-    )
+    // Quantify only QC-passed samples, then merge count matrices -- wait for
+    // both quantification and samplesheet filtering
+    if ( params.quantifier == 'salmon' ) {
+        quant_ch = SALMON_QUANT(filtered_trimmed_ch, salmon_index_ch)
+        quant_success_ch = quant_ch.filter { quant_dir -> quant_dir != null }
+        count_matrix_ch = MERGE_COUNTS(
+            quant_success_ch.collect(),
+            passed_ch
+        )
+    } else {
+        sam_ch = BOWTIE2_ALIGN(filtered_trimmed_ch, bowtie2_index_ch)
+        bam_ch = SAM_SORT_INDEX(sam_ch)
+        fc_ch  = FEATURECOUNTS(bam_ch, refGff)
+        fc_success_ch = fc_ch.filter { counts_file -> counts_file != null }
+        count_matrix_ch = MERGE_COUNTS_FEATURECOUNTS(
+            fc_success_ch.collect(),
+            passed_ch
+        )
+    }
 
     // Filter out samples with >50% zero values from expression matrices and samplesheet
     filtered_results = FILTER_LOW_EXPRESSION_SAMPLES(

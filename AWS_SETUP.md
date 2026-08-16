@@ -439,6 +439,7 @@ Suggested prefixes (matches what `run_MAPPED.sh` expects for `--outdir`/`--workd
 ```
 s3://my-mapped-bucket/results/   <- --outdir
 s3://my-mapped-bucket/work/      <- --workdir  (Nextflow's task staging area)
+s3://my-mapped-bucket/catalog/   <- run/sample discovery index, see §14
 ```
 
 ### Lifecycle rules (replaces local `--clean-mode`)
@@ -474,7 +475,9 @@ All five expiring prefixes (`fastqc`, `trimmed`, `salmon`, `multiqc`, plus the r
 `seqFiles/fastq`) are re-derivable by re-running the pipeline, matching exactly what
 local `--clean-mode` used to delete. Leave `results/expression_matrices/` and
 `results/samplesheet/` (the equivalent of what
-local `--clean-mode` preserves) with no expiration rule.
+local `--clean-mode` preserves) with no expiration rule. `catalog/` (§14) is likewise
+left with no expiration rule — it's small (metadata rows, not raw data) and is the whole
+point of §14, not a disposable intermediate.
 
 ---
 
@@ -981,9 +984,10 @@ all — that's how this section was actually validated.
 On the instance:
 
 ```bash
-# Java (Nextflow requires 17+) and AWS CLI (for the sample-count summary /
-# clean-mode-guard branches in run_MAPPED.sh) -- both in one go
-sudo yum install -y java-17-amazon-corretto-headless git aws-cli
+# Java (Nextflow requires 17+), AWS CLI (for the sample-count summary /
+# clean-mode-guard branches in run_MAPPED.sh), and pip (for catalog/register_run.py,
+# §14 -- the Java/aws-cli/git trio alone isn't enough once Step 5 is in the mix)
+sudo yum install -y java-17-amazon-corretto-headless git aws-cli python3-pip
 
 # Nextflow
 curl -s https://get.nextflow.io | bash
@@ -991,6 +995,9 @@ sudo mv nextflow /usr/local/bin/
 
 git clone https://github.com/dalbabur/MAPPED_AWS.git
 cd MAPPED_AWS
+
+# Packages register_run.py needs (pandas/pyarrow/awswrangler) -- see §14
+pip3 install --user -r catalog/requirements.txt
 ```
 
 **The repo needs to be publicly cloneable for the plain `git clone` above to work
@@ -1107,7 +1114,250 @@ Check, in order:
 
 ---
 
-## 14. Explicitly out of scope for this pass
+## 14. Glue Data Catalog (run/sample discovery index)
+
+Every S3-mode `run_MAPPED.sh` invocation now self-registers into a small Glue Data
+Catalog right after Stage 4 completes (`catalog/register_run.py`, invoked as "Step 5" —
+see `run_MAPPED.sh`) — a queryable index of every run and sample ever processed into this
+bucket, so you can ask "which runs exist for organism X" or "has accession Y already been
+processed, and where" without already knowing every `--outdir` anyone has ever used. This
+section provisions the Glue database/tables once, admin-side; nothing here is created
+lazily by the pipeline itself.
+
+### 14.1 Glue database and tables
+
+One-time, run from wherever you run privileged `aws` CLI commands (same as §2-§8). Both
+tables are partitioned by `run_id` and populated directly by `register_run.py` via the
+`awswrangler` Python package — **no crawler is used or needed**: each run registers its
+own partition at write time (`mode="overwrite_partitions"`), so it's queryable
+immediately after Step 5 finishes, with no crawl-lag, and two runs with different
+`--outdir` values (hence different `run_id`s) never contend for the same partition even
+if they finish at the same time.
+
+```bash
+aws glue create-database --database-input '{"Name":"mapped_catalog"}'
+
+cat > mapped-runs-table.json <<'EOF'
+{
+  "Name": "mapped_runs",
+  "StorageDescriptor": {
+    "Columns": [
+      {"Name": "outdir", "Type": "string"},
+      {"Name": "workdir", "Type": "string"},
+      {"Name": "organism", "Type": "string"},
+      {"Name": "strain", "Type": "string"},
+      {"Name": "bioproject", "Type": "string"},
+      {"Name": "sra_accessions", "Type": "string"},
+      {"Name": "ref_accession", "Type": "string"},
+      {"Name": "ref_accession_used", "Type": "string"},
+      {"Name": "library_layout", "Type": "string"},
+      {"Name": "quantifier", "Type": "string"},
+      {"Name": "cpu", "Type": "int"},
+      {"Name": "run_timestamp", "Type": "timestamp"},
+      {"Name": "n_samples_downloaded", "Type": "int"},
+      {"Name": "n_samples_passed_qc", "Type": "int"},
+      {"Name": "aws_batch_queue", "Type": "string"}
+    ],
+    "Location": "s3://my-mapped-bucket/catalog/runs/",
+    "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+    "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+    "SerdeInfo": {
+      "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
+    }
+  },
+  "PartitionKeys": [{"Name": "run_id", "Type": "string"}],
+  "TableType": "EXTERNAL_TABLE"
+}
+EOF
+aws glue create-table --database-name mapped_catalog --table-input file://mapped-runs-table.json
+
+cat > mapped-samples-table.json <<'EOF'
+{
+  "Name": "mapped_samples",
+  "StorageDescriptor": {
+    "Columns": [
+      {"Name": "experiment_accession", "Type": "string"},
+      {"Name": "sra_run_ids", "Type": "string"},
+      {"Name": "organism", "Type": "string"},
+      {"Name": "outdir", "Type": "string"},
+      {"Name": "quantifier", "Type": "string"},
+      {"Name": "bam_path", "Type": "string"},
+      {"Name": "run_accession", "Type": "string"},
+      {"Name": "sample_accession", "Type": "string"},
+      {"Name": "secondary_sample_accession", "Type": "string"},
+      {"Name": "study_accession", "Type": "string"},
+      {"Name": "secondary_study_accession", "Type": "string"},
+      {"Name": "submission_accession", "Type": "string"},
+      {"Name": "run_alias", "Type": "string"},
+      {"Name": "experiment_alias", "Type": "string"},
+      {"Name": "sample_alias", "Type": "string"},
+      {"Name": "study_alias", "Type": "string"},
+      {"Name": "library_layout", "Type": "string"},
+      {"Name": "library_selection", "Type": "string"},
+      {"Name": "library_source", "Type": "string"},
+      {"Name": "library_strategy", "Type": "string"},
+      {"Name": "library_name", "Type": "string"},
+      {"Name": "instrument_model", "Type": "string"},
+      {"Name": "instrument_platform", "Type": "string"},
+      {"Name": "base_count", "Type": "string"},
+      {"Name": "read_count", "Type": "string"},
+      {"Name": "tax_id", "Type": "string"},
+      {"Name": "scientific_name", "Type": "string"},
+      {"Name": "sample_title", "Type": "string"},
+      {"Name": "experiment_title", "Type": "string"},
+      {"Name": "study_title", "Type": "string"},
+      {"Name": "sample_description", "Type": "string"},
+      {"Name": "fastq_1", "Type": "string"},
+      {"Name": "fastq_2", "Type": "string"},
+      {"Name": "fastq_md5", "Type": "string"},
+      {"Name": "fastq_bytes", "Type": "string"},
+      {"Name": "fastq_ftp", "Type": "string"},
+      {"Name": "fastq_galaxy", "Type": "string"},
+      {"Name": "fastq_aspera", "Type": "string"}
+    ],
+    "Location": "s3://my-mapped-bucket/catalog/samples/",
+    "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+    "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+    "SerdeInfo": {
+      "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
+    }
+  },
+  "PartitionKeys": [{"Name": "run_id", "Type": "string"}],
+  "TableType": "EXTERNAL_TABLE"
+}
+EOF
+aws glue create-table --database-name mapped_catalog --table-input file://mapped-samples-table.json
+```
+
+`base_count`/`read_count` are deliberately `string`, not numeric — `DATA_VALIDATION`
+(`4_generate_count_matrix/main.nf`) semicolon-joins them (e.g. `"1234;5678"`) when
+multiple SRA runs merge into one experiment, which a numeric Glue type can't hold.
+`register_run.py` writes with `schema_evolution=False`, so a genuine mismatch between
+what it produces and what's declared here fails loudly at registration time rather than
+silently drifting the table.
+
+`bam_path` is the s3:// path(s) to the coordinate-sorted, indexed BAM(s) published under
+`<outdir>/bowtie2/` when `--quantifier bowtie2` (the default) was used — the point of
+aligning to the whole genome rather than a curated reference is that the BAM is reusable
+for analyses beyond gene counting (coverage, variant calling, inspecting non-coding
+regions), so this makes those files discoverable without already knowing the `--outdir`.
+Semicolon-joined and positionally parallel to `sra_run_ids` for multi-run experiments
+(same order, same run tags). Like `ref_accession_used` and the ENA `fastq_*` columns
+already in this table, it's constructed from the known publish-path convention, not
+verified to exist — a BAM whose alignment/counting step failed for one run of an
+otherwise-passing multi-run experiment would still get a path here that 404s. `NULL` for
+`--quantifier salmon` runs, which never produce a BAM.
+
+### 14.2 IAM — Glue and Athena access for the head node
+
+`MappedHeadNodeRole` already has full S3 access to the bucket (§3.5), which already
+covers writing the new `catalog/` prefix and reading/writing Athena's query-results
+prefix — nothing to add there. Add two **new**, separate inline policies (following the
+same additive `put-role-policy` pattern §3.3 already uses for `MappedPassBatchJobRole` —
+no need to touch the existing `MappedHeadNodeAccess` policy):
+
+**Glue** — scoped to partition/table reads and partition writes only, used by
+`register_run.py` (Step 5, every run) and by the Athena queries below (Athena needs Glue
+read access to resolve table schemas). Deliberately no
+`glue:CreateTable`/`DeleteTable`/`CreateDatabase` — table/database definitions stay
+admin-provisioned by §14.1 above; nothing at runtime ever creates or alters them.
+
+```bash
+aws iam put-role-policy --role-name MappedHeadNodeRole \
+  --policy-name MappedGlueCatalogAccess --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Action": [
+        "glue:GetDatabase", "glue:GetTable", "glue:GetTables",
+        "glue:GetPartition", "glue:GetPartitions", "glue:BatchGetPartition",
+        "glue:CreatePartition", "glue:BatchCreatePartition",
+        "glue:UpdatePartition", "glue:BatchUpdatePartition",
+        "glue:DeletePartition", "glue:BatchDeletePartition"
+      ],
+      "Resource": [
+        "arn:aws:glue:us-east-1:'"$ACCOUNT_ID"':catalog",
+        "arn:aws:glue:us-east-1:'"$ACCOUNT_ID"':database/mapped_catalog",
+        "arn:aws:glue:us-east-1:'"$ACCOUNT_ID"':table/mapped_catalog/mapped_runs",
+        "arn:aws:glue:us-east-1:'"$ACCOUNT_ID"':table/mapped_catalog/mapped_samples"
+      ]
+    }]
+  }'
+```
+
+**Athena** — needed specifically by `catalog/filter_processed_samples.py` (`--skip-processed`,
+`run_MAPPED.sh`), which runs a real SQL query rather than just reading/writing a
+partition. Scoped to the `primary` workgroup only:
+
+```bash
+aws iam put-role-policy --role-name MappedHeadNodeRole \
+  --policy-name MappedAthenaQueryAccess --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Action": [
+        "athena:StartQueryExecution", "athena:GetQueryExecution",
+        "athena:GetQueryResults", "athena:GetWorkGroup"
+      ],
+      "Resource": "arn:aws:athena:us-east-1:'"$ACCOUNT_ID"':workgroup/primary"
+    }]
+  }'
+```
+
+(`$ACCOUNT_ID` here is the same shell variable set in §7 —
+`ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)` — re-run that
+first if you're in a fresh shell.)
+
+### 14.3 Athena query results location
+
+Athena needs somewhere to write query results before it'll run anything:
+
+```bash
+aws athena update-work-group --work-group primary --configuration-updates '{
+    "ResultConfigurationUpdates": {"OutputLocation": "s3://my-mapped-bucket/athena-results/"}
+  }'
+```
+
+### 14.4 Trying it out
+
+After the next `run_MAPPED.sh` invocation against `s3://` paths completes, you should see
+a "Step 5: Register run in catalog" block in its output, after Step 4 and before "All
+steps completed successfully!". Query what's there — from the Athena console's query
+editor, or `aws athena start-query-execution` + `get-query-results` from the CLI:
+
+```sql
+-- Which runs exist for organism X
+SELECT run_id, outdir, strain, bioproject, run_timestamp, n_samples_passed_qc
+FROM mapped_catalog.mapped_runs
+WHERE organism = 'Escherichia coli'
+ORDER BY run_timestamp DESC;
+
+-- Has SRX14436231 already been processed, and where
+SELECT s.run_id, s.experiment_accession, s.outdir, r.run_timestamp
+FROM mapped_catalog.mapped_samples s
+JOIN mapped_catalog.mapped_runs r ON s.run_id = r.run_id
+WHERE s.experiment_accession = 'SRX14436231';
+
+-- Find BAM files for other analyses (coverage, variant calling, etc.) without
+-- already knowing which --outdir they came from
+SELECT experiment_accession, organism, bam_path
+FROM mapped_catalog.mapped_samples
+WHERE organism = 'Pseudomonas putida' AND bam_path IS NOT NULL;
+
+-- Browse everything ever processed
+SELECT organism, COUNT(DISTINCT run_id) AS n_runs, SUM(n_samples_passed_qc) AS total_samples
+FROM mapped_catalog.mapped_runs
+GROUP BY organism
+ORDER BY n_runs DESC;
+```
+
+**Out of scope**: this catalog answers "what exists and where," not "give me one combined
+matrix." Merging `expression_matrices/*.csv` across multiple runs of the same organism is
+a manual step you'd do yourself, using the `outdir` values these queries return.
+
+---
+
+## 15. Explicitly out of scope for this pass
 
 Documented here so it isn't mistaken for an oversight — none of the following is built,
 and none is required for the pipeline to run correctly on AWS today:

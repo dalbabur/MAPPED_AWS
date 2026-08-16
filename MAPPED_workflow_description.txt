@@ -61,7 +61,26 @@ STEP 4: GENERATE COUNT MATRIX (4_generate_count_matrix)
 -------------------------------------------------------
 Purpose: Process FASTQ files to generate gene expression matrices
 
-Processes:
+--quantifier selects one of two quantification paths (default 'bowtie2'; see
+4_generate_count_matrix/README.md for the tradeoffs). Both converge on the same
+expression_matrices/{tpm,log_tpm,counts}.csv format, so everything after quantification
+(steps 6-12 below) is identical either way.
+
+Processes (--quantifier bowtie2, default):
+1. BOWTIE2_BUILD
+   - Builds a Bowtie2 index from the whole reference genome (not CDS-only)
+
+2. BOWTIE2_ALIGN
+   - Aligns trimmed reads to the whole genome
+
+2b. SAM_SORT_INDEX
+   - Coordinate-sorts and indexes the alignments (samtools)
+
+2c. FEATURECOUNTS
+   - Assigns aligned reads to every 'gene' feature in the GFF, grouped by locus_tag --
+     protein-coding, tRNA, rRNA, and ncRNA genes alike, not just CDS
+
+Processes (--quantifier salmon, opt-in):
 1. EXTRACT_CDS
    - Extracts coding sequences from reference genome using GFF annotations
    - Uses gffread tool
@@ -70,6 +89,7 @@ Processes:
    - Builds Salmon index from CDS sequences
    - Enables fast transcript quantification
 
+Shared processes (either --quantifier):
 3. TRIMGALORE
    - Quality and adapter trimming of raw FASTQ files
    - Automatic adapter detection
@@ -78,7 +98,7 @@ Processes:
    - Quality control analysis of trimmed reads
    - Generates QC reports for each sample
 
-5. SALMON_QUANT
+5. SALMON_QUANT (--quantifier salmon only)
    - Quantifies transcript expression using Salmon
    - Validates mappings and applies minimum fragment threshold
 
@@ -123,7 +143,8 @@ QUALITY CONTROL FEATURES
 ------------------------
 - Multi-level quality filtering:
   * FastQC metrics (per-base quality, N content)
-  * Salmon mapping validation
+  * Bowtie2/featureCounts assignment (default) or Salmon mapping validation
+    (--quantifier salmon)
   * Low expression sample removal
 - Automatic handling of technical replicates
 - Experiment-level QC (all runs for an experiment must pass)

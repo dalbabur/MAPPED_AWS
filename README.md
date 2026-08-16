@@ -25,7 +25,9 @@ The pipeline is designed to handle large-scale datasets with built-in error hand
 - **Comprehensive quality control**: FastQC and MultiQC reports included
 - **Strain filtering**: Optionally restrict samples by strain token in ScientificName
 - **AWS-ready**: Run on AWS Batch against S3, with FASTQ sourced directly from NCBI SRA's
-  AWS Open Data buckets instead of ENA's FTP mirror — see [Running on AWS](#running-on-aws)
+  AWS Open Data buckets instead of ENA's FTP mirror — see [Running on AWS](#running-on-aws).
+  Every AWS-mode run also self-registers into a queryable Glue/Athena catalog of runs and
+  samples, so results from different runs can be discovered and cross-referenced later
 
 ## Prerequisites
 
@@ -124,6 +126,42 @@ This requires the AWS environment (IAM roles, VPC, S3 buckets, AWS Batch compute
 environment/queue) described in **[AWS_SETUP.md](AWS_SETUP.md)** to already exist.
 `--clean-mode` is local-only (use an S3 Lifecycle rule instead — see AWS_SETUP.md).
 
+### Run/sample discovery catalog
+
+Every run against `s3://` `--outdir`/`--workdir` also registers itself, right after
+Stage 4 finishes, into a small AWS Glue Data Catalog spanning the whole bucket —
+`s3://<bucket>/catalog/runs/` and `s3://<bucket>/catalog/samples/`, queryable via Athena
+as `mapped_catalog.mapped_runs` / `mapped_catalog.mapped_samples`. This is how you find
+what's already been processed (by organism, strain, BioProject, or SRA/ENA accession)
+across every run anyone has pointed at the bucket, without needing to know each run's
+`--outdir` ahead of time. It's a discovery index only — it does not merge or deduplicate
+`expression_matrices/` across runs. Setup (one-time, admin-provisioned) and example
+queries are in [AWS_SETUP.md](AWS_SETUP.md), §14.
+
+### Skipping already-processed samples
+
+Pass `--skip-processed` to avoid redownloading and requantifying a sample your bucket has
+already fully processed. Before Step 2 (FASTQ download), it queries the catalog above for
+accessions already processed for this `--organism` **against the same reference genome**
+— not organism alone, since the same accession quantified against a different reference
+is a different result, not a repeat of the same computation — and removes them from this
+run's sample list. To know the reference genome ahead of the usual point in the pipeline,
+`--skip-processed` runs Step 3 (reference genome download) before Step 2 instead of after
+it; this only happens when the flag is set, so it changes nothing for runs that don't use
+it. If every requested sample turns out to already be processed, the run stops right there
+(nothing to download) and tells you where the existing results live — it does not merge
+them into this run for you; that's still a manual step using the `outdir` it reports.
+
+```bash
+./run_MAPPED.sh \
+    --organism "Pseudomonas putida" \
+    --outdir s3://my-mapped-bucket/results/putida-batch2 \
+    --workdir s3://my-mapped-bucket/work/putida-batch2 \
+    --library_layout single \
+    --skip-processed \
+    --cpu 16
+```
+
 ## Pipeline Modules
 
 ### 1. Download Metadata (Module 1)
@@ -148,7 +186,9 @@ environment/queue) described in **[AWS_SETUP.md](AWS_SETUP.md)** to already exis
 ### 4. Generate Count Matrix (Module 4)
 - Performs quality control on raw reads (FastQC)
 - Trims adapters and low-quality bases (TrimGalore)
-- Quantifies gene expression using Salmon
+- Quantifies gene expression against every gene type in the GFF (protein-coding, tRNA,
+  rRNA, ncRNA) using Bowtie2 + featureCounts (default), or optionally the original
+  CDS-only Salmon path via `--quantifier salmon` (see `4_generate_count_matrix/README.md`)
 - Generates normalized expression matrices (TPM and raw counts)
 - Creates comprehensive quality reports (MultiQC)
 
@@ -172,6 +212,8 @@ environment/queue) described in **[AWS_SETUP.md](AWS_SETUP.md)** to already exis
 | `--max_concurrent_downloads` | Maximum number of concurrent FASTQ downloads | `20` | `10` |
 | `--strain` | Filter by strain token in `ScientificName` (case-insensitive token equals/contains) | none | `K-12` |
 | `--clean-mode` | Remove intermediate files after completion | `false` | (flag) |
+| `--force` | Proceed even if `--outdir` already holds results from a different configuration (see [Output directory reuse](#output-directory-reuse)) | `false` | (flag) |
+| `--skip-processed` | s3:// mode only. Skip samples already processed for this organism against the same reference genome (see [Skipping already-processed samples](#skipping-already-processed-samples)) | `false` | (flag) |
 | `-h, --help` | Display help message | - | (flag) |
 
 ## Output Structure
@@ -180,6 +222,7 @@ The pipeline creates a well-organized output directory structure:
 
 ```
 ${outdir}/
+├── .mapped_run_manifest         # Records this run's configuration (see below); not a pipeline result
 ├── metadata/                    # Downloaded and formatted metadata
 │   ├── <Organism>_metadata.tsv  # Cleaned metadata (optionally strain-filtered)
 │   └── sample_id.csv            # List of SRA accessions (optionally strain-filtered)
@@ -198,7 +241,9 @@ ${outdir}/
 ├── trimmed/                     # Adapter-trimmed FASTQ files
 │   ├── *_trimmed.fq.gz          # Trimmed sequences
 │   └── *_trimming_report.txt
-├── salmon/                      # Expression quantification
+├── bowtie2/                      # Sorted, indexed BAMs (--quantifier bowtie2, default)
+├── featurecounts/                # Per-sample gene counts (--quantifier bowtie2, default)
+├── salmon/                       # Expression quantification (--quantifier salmon)
 │   └── <sample_id>/
 │       └── quant.sf             # Quantification results
 ├── expression_matrices/         # Final expression data
@@ -210,6 +255,32 @@ ${outdir}/
     ├── multiqc_report.html      # Interactive report
     └── multiqc_data/            # Raw MultiQC data
 ```
+
+### Output directory reuse
+
+`run_MAPPED.sh` refuses to run if `--outdir` already holds results from a *different*
+configuration than the one you just passed — several `publishDir` directives overwrite
+in place, so reusing an `--outdir` by mistake would silently destroy prior results.
+
+On every run, it compares `--organism`/`--strain`/`--bioproject`/`--sra_accessions`/
+`--library_layout`/`--ref-accession` (the parameters that determine *what data* ends up
+in `--outdir` — not `--workdir`/`--cpu`, which are safe to change) against
+`.mapped_run_manifest`, a small file it writes at the root of `--outdir` the first time
+it's used:
+
+- **First use of an `--outdir`**: no manifest yet, proceeds normally and writes one.
+- **Same `--outdir`, same configuration** (e.g. resuming after an interruption): manifest
+  matches, proceeds normally — this is the normal resume workflow and needs no extra flag.
+- **Same `--outdir`, different configuration**: refuses to run, and shows exactly which
+  parameters differ from what's recorded. Pick a different `--outdir`, or pass `--force`
+  to proceed anyway and overwrite (this also re-registers the manifest with the new
+  configuration, so later runs against this same `--outdir` are compared against it
+  instead).
+
+This is a best-effort guard, not a distributed lock — two invocations starting at the
+exact same instant against the same fresh `--outdir` can still race. In practice this
+only matters if you're scripting concurrent launches; for normal interactive use it isn't
+a concern.
 
 ### Clean Mode Output
 
