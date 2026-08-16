@@ -1,0 +1,37 @@
+name: Unit tests
+
+# Runs the count-matrix pipeline's Python logic (4_generate_count_matrix/bin/) against
+# small synthetic fixtures -- no AWS, no Docker, no network. Deliberately narrow in
+# scope: it catches logic bugs in the pipeline's data-wrangling code (the class of bug
+# that previously hid undetected in inline Nextflow heredocs -- see git history for
+# 4_generate_count_matrix/main.nf), not infrastructure or Nextflow-DSL issues, which
+# still require a real AWS Batch run to exercise.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "4_generate_count_matrix/bin/**"
+      - "4_generate_count_matrix/tests/**"
+      - ".github/workflows/test.yml"
+  pull_request:
+    paths:
+      - "4_generate_count_matrix/bin/**"
+      - "4_generate_count_matrix/tests/**"
+      - ".github/workflows/test.yml"
+  workflow_dispatch: {}
+
+jobs:
+  generate_count_matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: pip install -r 4_generate_count_matrix/tests/requirements.txt
+
+      - name: Run pytest
+        run: pytest 4_generate_count_matrix/tests/ -v
