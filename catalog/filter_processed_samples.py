@@ -15,6 +15,14 @@ quantified against a different reference is a different result, not a repeat of 
 same computation, so organism-only matching would wrongly skip work that should
 actually rerun.
 
+Also matches on --annotation-version when available (the NCBI PGAP annotation release,
+e.g. 'GCF_000007565.2-RS_2025_02_17') -- NCBI can re-run annotation on the same assembly
+accession without bumping that accession's own version, so ref_accession_used alone
+can't detect a re-annotated gene set. When --annotation-version can't be resolved (e.g.
+older catalog entries from before this existed, or an accession with no RefSeq
+annotation at all), matching falls back to organism + ref_accession_used only rather
+than refusing to skip anything.
+
 Always prints a final 'REMAINING_COUNT=<n>' line so run_MAPPED.sh can decide whether
 there's anything left for Stage 2 to do.
 """
@@ -52,6 +60,7 @@ def main(argv=None) -> int:
     parser.add_argument("--outdir", required=True)
     parser.add_argument("--organism", required=True)
     parser.add_argument("--ref-accession-used", required=True)
+    parser.add_argument("--annotation-version", default=None)
     args = parser.parse_args(argv)
 
     outdir = args.outdir.rstrip("/")
@@ -73,11 +82,15 @@ def main(argv=None) -> int:
 
     organism_sql = args.organism.replace("'", "''")
     ref_sql = args.ref_accession_used.replace("'", "''")
+    annotation_clause = ""
+    if args.annotation_version:
+        annotation_sql = args.annotation_version.replace("'", "''")
+        annotation_clause = f"AND r.annotation_version = '{annotation_sql}'"
     query = f"""
         SELECT DISTINCT s.experiment_accession, s.outdir
         FROM {GLUE_DATABASE}.mapped_samples s
         JOIN {GLUE_DATABASE}.mapped_runs r ON s.run_id = r.run_id
-        WHERE r.organism = '{organism_sql}' AND r.ref_accession_used = '{ref_sql}'
+        WHERE r.organism = '{organism_sql}' AND r.ref_accession_used = '{ref_sql}' {annotation_clause}
     """
     try:
         processed_df = wr.athena.read_sql_query(query, database=GLUE_DATABASE, boto3_session=_BOTO3_SESSION)

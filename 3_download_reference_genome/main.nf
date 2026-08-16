@@ -197,13 +197,19 @@ process DOWNLOAD_REFERENCE_BY_ACCESSION {
         fi
     done
     
-    # Create a summary JSON for compatibility
-    echo '{"ref_accession": "${accession}"}' > ref_genome/datasets_summary.json
-    
+    # Save the datasets summary -- includes annotation_info (annotation release name/date),
+    # which register_run.py and --skip-processed both rely on to detect a re-annotation of
+    # this same assembly accession later (NCBI bumps annotation_info, not the accession
+    # version, when it re-runs PGAP on unchanged sequence). A previous version of this
+    # process wrote a placeholder `{"ref_accession": "..."}` here instead of the real
+    # report, silently discarding that information for every accession-mode download.
+    datasets summary genome accession "${accession}" --as-json-lines > summary.jsonl
+    cp summary.jsonl ref_genome/datasets_summary.json
+
     # Ensure output files are world-readable for publishDir
     chmod a+r ref_genome/*
-    
+
     # Cleanup
-    rm -rf tmp ref.zip
+    rm -rf tmp ref.zip summary.jsonl
     """
 }

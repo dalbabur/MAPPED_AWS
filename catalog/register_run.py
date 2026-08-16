@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import os
 import re
 import subprocess
@@ -112,12 +113,46 @@ def resolve_ref_accession_used(outdir: str) -> str | None:
     return matches[0]
 
 
+def resolve_annotation_version(outdir: str, ref_accession_used: str | None) -> str | None:
+    """Best-effort: the NCBI annotation release actually used for ref_accession_used
+    (e.g. 'GCF_000007565.2-RS_2025_02_17'), read from datasets_summary.json.
+
+    Distinct from the assembly accession itself -- NCBI can re-run its PGAP annotation
+    pipeline on the same assembly accession without bumping that accession's version, so
+    this is what actually changes when gene annotations get updated later. None if the
+    summary is missing/unreadable, has no record matching ref_accession_used, or the
+    assembly has no RefSeq annotation at all (e.g. a GenBank-only GCA_ accession).
+    """
+    if not ref_accession_used:
+        return None
+    text = s3_cat(f"{outdir}/seqFiles/ref_genome/datasets_summary.json")
+    if not text:
+        return None
+    # datasets_summary.json is JSON-lines (one record per candidate genome for
+    # auto-select mode, one line for accession mode) -- match the specific record for
+    # the accession actually downloaded rather than assuming line 1.
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("accession") != ref_accession_used:
+            continue
+        annotation_info = record.get("annotation_info") or {}
+        return annotation_info.get("name") or annotation_info.get("release_date")
+    return None
+
+
 def build_runs_row(
     args: argparse.Namespace,
     run_id: str,
     download_df: pd.DataFrame | None,
     samplesheet_df: pd.DataFrame | None,
     ref_accession_used: str | None,
+    annotation_version: str | None,
 ) -> pd.DataFrame:
     row = {
         "run_id": run_id,
@@ -129,6 +164,7 @@ def build_runs_row(
         "sra_accessions": args.sra_accessions,
         "ref_accession": args.ref_accession,
         "ref_accession_used": ref_accession_used,
+        "annotation_version": annotation_version,
         "library_layout": args.library_layout,
         "quantifier": args.quantifier,
         "cpu": int(args.cpu) if args.cpu else None,
@@ -140,7 +176,7 @@ def build_runs_row(
     df = pd.DataFrame([row])
     string_cols = [
         "run_id", "outdir", "workdir", "organism", "strain", "bioproject",
-        "sra_accessions", "ref_accession", "ref_accession_used",
+        "sra_accessions", "ref_accession", "ref_accession_used", "annotation_version",
         "library_layout", "quantifier", "aws_batch_queue",
     ]
     for col in string_cols:
@@ -241,8 +277,9 @@ def main(argv=None) -> int:
     download_df = read_csv_from_s3(f"{outdir}/samplesheet/samplesheet_download.csv")
     samplesheet_df = read_csv_from_s3(f"{outdir}/samplesheet/samplesheet.csv")
     ref_accession_used = resolve_ref_accession_used(outdir)
+    annotation_version = resolve_annotation_version(outdir, ref_accession_used)
 
-    runs_row = build_runs_row(args, run_id, download_df, samplesheet_df, ref_accession_used)
+    runs_row = build_runs_row(args, run_id, download_df, samplesheet_df, ref_accession_used, annotation_version)
     samples_df = build_samples_df(samplesheet_df, run_id, args.organism, outdir, args.quantifier)
 
     wr.s3.to_parquet(
@@ -259,6 +296,7 @@ def main(argv=None) -> int:
             "outdir": "string", "workdir": "string", "organism": "string",
             "strain": "string", "bioproject": "string", "sra_accessions": "string",
             "ref_accession": "string", "ref_accession_used": "string",
+            "annotation_version": "string",
             "library_layout": "string", "quantifier": "string", "cpu": "int",
             "run_timestamp": "timestamp", "n_samples_downloaded": "int",
             "n_samples_passed_qc": "int", "aws_batch_queue": "string",

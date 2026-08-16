@@ -333,8 +333,32 @@ if [[ "$SKIP_PROCESSED" == "true" ]]; then
   if [[ -z "$REF_ACCESSION_USED" ]]; then
     echo "WARNING: could not resolve a reference genome accession from $OUTDIR/seqFiles/ref_genome/ -- skipping --skip-processed filtering for this run."
   else
+    # Best-effort: the specific NCBI annotation release for $REF_ACCESSION_USED (distinct
+    # from the accession itself -- see catalog/filter_processed_samples.py's docstring for
+    # why this matters). datasets_summary.json is JSON-lines, one record per candidate
+    # genome for auto-select mode, so match the record for the accession actually
+    # downloaded rather than assuming line 1. Empty on any failure -- filter_processed_
+    # samples.py falls back to organism + ref-accession-used matching when this is blank.
+    ANNOTATION_VERSION=$(aws s3 cp "$OUTDIR/seqFiles/ref_genome/datasets_summary.json" - 2>/dev/null | python3 -c "
+import json, sys
+target = '$REF_ACCESSION_USED'
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if record.get('accession') != target:
+        continue
+    info = record.get('annotation_info') or {}
+    print(info.get('name') or info.get('release_date') or '')
+    break
+" 2>/dev/null || true)
+
     echo "=== Filtering already-processed samples from catalog ==="
-    if FILTER_OUTPUT=$(python3 catalog/filter_processed_samples.py --outdir "$OUTDIR" --organism "$ORGANISM" --ref-accession-used "$REF_ACCESSION_USED"); then
+    if FILTER_OUTPUT=$(python3 catalog/filter_processed_samples.py --outdir "$OUTDIR" --organism "$ORGANISM" --ref-accession-used "$REF_ACCESSION_USED" ${ANNOTATION_VERSION:+--annotation-version "$ANNOTATION_VERSION"}); then
       echo "$FILTER_OUTPUT"
       REMAINING_COUNT=$(printf '%s\n' "$FILTER_OUTPUT" | grep -m1 '^REMAINING_COUNT=' | cut -d= -f2-)
       if [[ "$REMAINING_COUNT" == "0" ]]; then

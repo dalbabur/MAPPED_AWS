@@ -1150,6 +1150,7 @@ cat > mapped-runs-table.json <<'EOF'
       {"Name": "sra_accessions", "Type": "string"},
       {"Name": "ref_accession", "Type": "string"},
       {"Name": "ref_accession_used", "Type": "string"},
+      {"Name": "annotation_version", "Type": "string"},
       {"Name": "library_layout", "Type": "string"},
       {"Name": "quantifier", "Type": "string"},
       {"Name": "cpu", "Type": "int"},
@@ -1247,6 +1248,16 @@ already in this table, it's constructed from the known publish-path convention, 
 verified to exist — a BAM whose alignment/counting step failed for one run of an
 otherwise-passing multi-run experiment would still get a path here that 404s. `NULL` for
 `--quantifier salmon` runs, which never produce a BAM.
+
+`annotation_version` (`mapped_runs` only) is the NCBI PGAP annotation release actually
+used, e.g. `GCF_000007565.2-RS_2025_02_17` — distinct from `ref_accession_used`, since
+NCBI can re-run annotation on the same assembly accession (adding/removing genes,
+correcting boundaries) without bumping that accession's own version number. Read from
+`datasets_summary.json` in Stage 3's output; `NULL` if that record has no RefSeq
+annotation (e.g. a GenBank-only `GCA_` accession) or couldn't be resolved.
+`filter_processed_samples.py` (`--skip-processed`) matches on this in addition to
+`organism`/`ref_accession_used` when available, so a later re-annotation of the same
+assembly correctly triggers a re-run instead of being skipped as already processed.
 
 ### 14.2 IAM — Glue and Athena access for the head node
 
