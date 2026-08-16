@@ -452,10 +452,12 @@ process FILTER_SAMPLESHEET {
         
         while IFS= read -r sample_id; do
             if [ -n "\$sample_id" ]; then
-                # Look for lines where the id column matches the sample ID exactly
-                # Use awk to properly parse CSV and check the id column dynamically
+                # Look for lines where the id column matches the sample ID exactly.
+                # Strip a leading/trailing double-quote from the field before comparing,
+                # so this matches regardless of whether the CSV quotes its id values
+                # (mirrors the id_col detection above, which already tolerates both).
                 awk -F',' -v col="\$id_col" -v sample="\$sample_id" '
-                    NR > 1 && \$col == "\\"" sample "\\"" { print }
+                    NR > 1 { val = \$col; gsub(/^"|"\$/, "", val); if (val == sample) print }
                 ' tmp.csv >> samplesheet.csv || true
             fi
         done < ${passedlist}
