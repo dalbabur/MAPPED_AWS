@@ -79,6 +79,35 @@ def test_merge_experiment_runs_single_run_still_computes_tpm_unlike_salmon_varia
     assert final_tpm["SRX1"] == [1_000_000.0]
 
 
+def test_write_matrices_no_data_writes_header_only_files(tmp_path):
+    mfc.write_matrices(None, {}, {}, outdir=str(tmp_path))
+
+    for name in ("counts.csv", "tpm.csv", "log_tpm.csv"):
+        assert (tmp_path / name).read_text() == "GeneID\n"
+
+
+def test_write_matrices_writes_expected_csv_content(tmp_path):
+    gene_ids = ["g1", "g2"]
+    final_counts = {"SRX1": [5, 15], "SRX2": [1, 2]}
+    final_tpm = {"SRX1": [10.0, 20.0], "SRX2": [0.0, 0.0]}
+
+    mfc.write_matrices(gene_ids, final_counts, final_tpm, outdir=str(tmp_path))
+
+    counts_lines = (tmp_path / "counts.csv").read_text().splitlines()
+    assert counts_lines[0] == "GeneID,SRX1,SRX2"
+    assert counts_lines[1] == "g1,5,1"
+    assert counts_lines[2] == "g2,15,2"
+
+    tpm_lines = (tmp_path / "tpm.csv").read_text().splitlines()
+    assert tpm_lines[1] == "g1,10.000000,0.000000"
+
+    log_tpm_lines = (tmp_path / "log_tpm.csv").read_text().splitlines()
+    # log2(10 + 1) = log2(11) ~= 3.459432
+    assert log_tpm_lines[1].startswith("g1,3.459")
+    # log2(0 + 1) = 0
+    assert log_tpm_lines[1].endswith(",0.000000")
+
+
 def test_main_end_to_end(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     write_counts_file(tmp_path / "SRX1_SRR1_counts.txt", "a.bam", ["g1", "g2"], [100, 200], [10, 20])

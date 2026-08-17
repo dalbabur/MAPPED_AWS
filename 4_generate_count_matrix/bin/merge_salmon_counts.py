@@ -116,7 +116,10 @@ def write_matrices(gene_ids, final_counts, final_tpm, outdir="."):
     """Write counts.csv/tpm.csv/log_tpm.csv (log2(TPM+1)).
 
     Writes header-only files when there's no data, matching the pipeline's existing
-    convention for a run with nothing to merge.
+    convention for a run with nothing to merge. Built via pandas rather than a
+    per-cell Python loop -- at compendium scale (hundreds of experiments x thousands
+    of genes) the loop was millions of individual f.write() calls for something
+    pandas does natively in milliseconds.
     """
     os.makedirs(outdir, exist_ok=True)
     counts_path = os.path.join(outdir, "counts.csv")
@@ -131,29 +134,16 @@ def write_matrices(gene_ids, final_counts, final_tpm, outdir="."):
 
     sorted_experiments = sorted(final_counts.keys())
 
-    with open(counts_path, "w") as f:
-        f.write("GeneID," + ",".join(sorted_experiments) + "\n")
-        for i, gene_id in enumerate(gene_ids):
-            f.write(gene_id)
-            for exp_id in sorted_experiments:
-                f.write(f",{final_counts[exp_id][i]}")
-            f.write("\n")
+    counts_df = pd.DataFrame(final_counts, index=gene_ids)[sorted_experiments]
+    counts_df.index.name = "GeneID"
+    counts_df.to_csv(counts_path)
 
-    with open(tpm_path, "w") as f:
-        f.write("GeneID," + ",".join(sorted_experiments) + "\n")
-        for i, gene_id in enumerate(gene_ids):
-            f.write(gene_id)
-            for exp_id in sorted_experiments:
-                f.write(f",{final_tpm[exp_id][i]:.6f}")
-            f.write("\n")
+    tpm_df = pd.DataFrame(final_tpm, index=gene_ids)[sorted_experiments]
+    tpm_df.index.name = "GeneID"
+    tpm_df.to_csv(tpm_path, float_format="%.6f")
 
-    with open(log_tpm_path, "w") as f:
-        f.write("GeneID," + ",".join(sorted_experiments) + "\n")
-        for i, gene_id in enumerate(gene_ids):
-            f.write(gene_id)
-            for exp_id in sorted_experiments:
-                f.write(f",{np.log2(final_tpm[exp_id][i] + 1):.6f}")
-            f.write("\n")
+    log_tpm_df = np.log2(tpm_df + 1)
+    log_tpm_df.to_csv(log_tpm_path, float_format="%.6f")
 
 
 def parse_args(args=None):

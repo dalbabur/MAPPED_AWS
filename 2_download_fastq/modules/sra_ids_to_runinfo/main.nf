@@ -1,4 +1,9 @@
 process SRA_IDS_TO_RUNINFO {
+    // Same knob as SRA_FASTQ_FTP/SRA_FASTQ_AWSODP -- without this, AWS Batch fans this
+    // out to one task per sample with no local throttle, all hitting ENA's metadata API
+    // simultaneously at compendium scale (hundreds of samples), unlike the download
+    // modules which have always capped this deliberately.
+    maxForks params.max_concurrent_downloads ?: 20
     tag "$id"
     label 'error_retry'
     errorStrategy 'ignore'
