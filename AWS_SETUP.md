@@ -925,7 +925,11 @@ aws ec2 describe-instance-types --region us-east-1 \
 `t4g.*` options in that list if you do this, they're ARM/Graviton and won't match the
 x86_64 AMI below.
 
-Uses `$SUBNET_ID`/`$SG_ID` from §4:
+Uses `$SUBNET_ID`/`$SG_ID` from §4, and passes `infra/bootstrap_head_node.sh` as
+user-data so the instance installs Java/git/aws-cli/Nextflow, clones this repo, and
+installs `catalog/register_run.py`'s Python dependencies automatically on first boot —
+no manual "on the instance" setup needed (that block below is now reference/recovery
+documentation, not something you need to run by hand for a fresh instance):
 
 ```bash
 AMI_ID=$(aws ssm get-parameter \
@@ -939,6 +943,7 @@ aws ec2 run-instances \
   --subnet-id "$SUBNET_ID" \
   --security-group-ids "$SG_ID" \
   --associate-public-ip-address \
+  --user-data file://infra/bootstrap_head_node.sh \
   --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":30}}]' \
   --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=mapped-head-node}]'
 ```
@@ -947,9 +952,12 @@ aws ec2 run-instances \
 `--block-device-mappings`/`--tag-specifications` here too. The fix here is simpler than
 §8's file-based workaround: both parameters accept AWS CLI's shorthand syntax instead of
 raw JSON, which has no embedded double quotes to get mangled — just wrap each in single
-quotes (verified working):
+quotes (verified working). `--user-data file://...` needs no such workaround — it reads
+the file's raw bytes directly, not through shell JSON parsing, so the same flag works
+unmodified on both bash and PowerShell:
 
 ```powershell
+--user-data file://infra/bootstrap_head_node.sh `
 --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=30}' `
 --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=mapped-head-node}]'
 ```
@@ -981,37 +989,54 @@ connect). Non-interactively (e.g. scripting this setup, or from a CLI-only sessi
 results with `aws ssm get-command-invocation`, without needing an interactive shell at
 all — that's how this section was actually validated.
 
-On the instance:
+**Verifying the bootstrap succeeded**: `--user-data` runs once, early in boot, well
+before `PingStatus: Online` necessarily means it's *finished* (SSM registration and the
+bootstrap script both start around the same time, and the script — mostly `yum`/`pip`
+package installs — took about a minute in testing, but don't assume that's a hard
+ceiling). Check `/var/log/cloud-init-output.log` for the script's own progress messages
+(prefixed `[bootstrap]`) and a final `Cloud-init v. ... finished ... Datasource
+DataSourceEc2.` line with no errors; then confirm directly:
 
 ```bash
-# Java (Nextflow requires 17+), AWS CLI (for the sample-count summary /
-# clean-mode-guard branches in run_MAPPED.sh), and pip (for catalog/register_run.py,
-# §14 -- the Java/aws-cli/git trio alone isn't enough once Step 5 is in the mix)
-sudo yum install -y java-17-amazon-corretto-headless git aws-cli python3-pip
-
-# Nextflow
-curl -s https://get.nextflow.io | bash
-sudo mv nextflow /usr/local/bin/
-
-git clone https://github.com/dalbabur/MAPPED_AWS.git
-cd MAPPED_AWS
-
-# Packages register_run.py needs (pandas/pyarrow/awswrangler) -- see §14
-pip3 install --user -r catalog/requirements.txt
+# via SSM send-command, or interactively over SSH/Session Manager
+git -C /home/ec2-user/MAPPED_AWS log -1 --oneline   # cloned, at HEAD
+sudo -u ec2-user -i nextflow -v                      # on ec2-user's PATH
 ```
 
-**The repo needs to be publicly cloneable for the plain `git clone` above to work
+If the instance needs fixing up later instead of relaunching — dependencies drifted, the
+repo needs a fresh `git pull`, whatever — every step in `infra/bootstrap_head_node.sh` is
+designed to be safe to re-run in place (`yum install` on already-installed packages,
+`nextflow`/pip installs guarded or naturally idempotent, `git clone` falling back to
+`git pull` if the repo directory already exists):
+
+```bash
+aws ssm send-command --instance-ids <id> --document-name AWS-RunShellScript \
+  --parameters commands='["bash /home/ec2-user/MAPPED_AWS/infra/bootstrap_head_node.sh"]'
+```
+
+**What the script does** (`infra/bootstrap_head_node.sh` — read it directly for the
+exact, current commands): installs Java 17, git, AWS CLI, and pip via `yum`; installs
+Nextflow to `/usr/local/bin/`; adds a `git config --system safe.directory` exception for
+this repo (without it, `aws ssm send-command`-driven `git` commands fail with "detected
+dubious ownership" — SSM runs as root, but the repo below is cloned as, and owned by,
+`ec2-user`); clones (or pulls, if already present) this repo to `/home/ec2-user/MAPPED_AWS`
+as `ec2-user`; and installs `catalog/register_run.py`'s Python dependencies
+(pandas/pyarrow/awswrangler, §14) via `pip3 install --user`.
+
+**The repo needs to be publicly cloneable for the plain `git clone` in the script to work
 non-interactively** — a private repo fails with `could not read Username for
 'https://github.com': No such device or address` (git trying to prompt for credentials
-with no terminal to prompt on). Either make the repo public, or use a GitHub
-fine-grained, read-only, single-repo access token embedded in the clone URL
-(`https://<token>@github.com/...`) if it needs to stay private. If you just flipped a
-repo from private to public, give GitHub's edge caches a few seconds — an immediate
-clone attempt can still 404/fail once before consistently succeeding.
+with no terminal to prompt on). Either make the repo public, or edit `REPO_URL` in
+`infra/bootstrap_head_node.sh` to embed a GitHub fine-grained, read-only, single-repo
+access token (`https://<token>@github.com/...`) if it needs to stay private. If you just
+flipped a repo from private to public, give GitHub's edge caches a few seconds — an
+immediate clone attempt can still 404/fail once before consistently succeeding.
 
 **Alternative**: [AWS Cloud9](https://aws.amazon.com/cloud9/) gives you the same thing
 (a persistent Linux environment with an IAM role attached) with less EC2 lifecycle
-management, if you prefer a managed IDE-style environment over raw EC2.
+management, if you prefer a managed IDE-style environment over raw EC2 — `--user-data`
+doesn't apply there, so you'd still run the commands inside `infra/bootstrap_head_node.sh`
+by hand once.
 
 ---
 
