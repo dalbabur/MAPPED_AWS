@@ -416,7 +416,7 @@ process PARSE_QC {
 // Process: filter sample sheet CSV based on passed samples
 process FILTER_SAMPLESHEET {
     tag 'filter_samplesheet'
-    container 'ubuntu:22.04'
+    container 'python:3.9-slim'
     publishDir "${params.outdir}/samplesheet", mode: 'copy', overwrite: true
     errorStrategy 'ignore'
 
@@ -429,50 +429,7 @@ process FILTER_SAMPLESHEET {
 
     script:
     """
-    # Copy original samplesheet and remove empty lines
-    grep -v '^[[:space:]]*\$' ${samplesheet} > tmp.csv
-    
-    # Check if passed samples file is empty
-    if [ ! -s ${passedlist} ]; then
-        echo "WARNING: No samples passed QC filters!"
-        # Create samplesheet with only header
-        head -n1 tmp.csv > samplesheet.csv
-    else
-        # Copy header
-        head -n1 tmp.csv > samplesheet.csv
-        
-        # Filter rows based on passed sample IDs
-        # First, find which column contains 'id' in the header
-        id_col=\$(head -n1 tmp.csv | tr ',' '\n' | grep -n '^"\\?id"\\?\$' | cut -d: -f1)
-        
-        if [ -z "\$id_col" ]; then
-            echo "ERROR: Could not find 'id' column in samplesheet"
-            exit 1
-        fi
-        
-        while IFS= read -r sample_id; do
-            if [ -n "\$sample_id" ]; then
-                # Look for lines where the id column matches the sample ID exactly.
-                # Strip a leading/trailing double-quote from the field before comparing,
-                # so this matches regardless of whether the CSV quotes its id values
-                # (mirrors the id_col detection above, which already tolerates both).
-                awk -F',' -v col="\$id_col" -v sample="\$sample_id" '
-                    NR > 1 { val = \$col; gsub(/^"|"\$/, "", val); if (val == sample) print }
-                ' tmp.csv >> samplesheet.csv || true
-            fi
-        done < ${passedlist}
-        
-        # Remove duplicates while preserving order
-        awk '!seen[\$0]++' samplesheet.csv > samplesheet_dedup.csv
-        mv samplesheet_dedup.csv samplesheet.csv
-    fi
-    
-    # Report results
-    original_count=\$(tail -n +2 tmp.csv | grep -c '^')
-    filtered_count=\$(tail -n +2 samplesheet.csv | grep -c '^')
-    echo "Original samples: \$original_count"
-    echo "Filtered samples: \$filtered_count"
-    echo "Samples removed: \$((\$original_count - \$filtered_count))"
+    filter_samplesheet.py --samplesheet ${samplesheet} --passed-samples-file ${passedlist}
     """
 }
 
@@ -573,11 +530,45 @@ process DATA_VALIDATION {
 // Main workflow
 //
 workflow {
+    // Captured now, at registration time, rather than read as `params.outdir` from
+    // *inside* the onComplete closure below -- doing that throws
+    // "NullPointerException: Cannot get property 'outdir' on null object" (confirmed via
+    // a live check against this Nextflow version): the `params` binding isn't reachable
+    // from onComplete's execution context, only a closure-captured local variable is.
+    def capturedOutdir = params.outdir
+
     // Registered here, not as a top-level `workflow.onComplete { }` statement --
     // Nextflow 26.x rejects that too, the same as any other bare top-level statement.
     workflow.onComplete {
         def logPattern = ~/\.nextflow\.log\.\d+/
         new File('.').listFiles().findAll { it.name ==~ logPattern }.each { it.delete() }
+
+        // Guard against a silent-completion failure mode: almost every process in this
+        // workflow uses errorStrategy 'ignore' with optional outputs, so if one of them
+        // genuinely fails (not just produces an empty result -- actually fails, e.g. a
+        // transient AWS Batch/S3 error), its output is never collected at all, and every
+        // downstream process waiting on that channel simply never fires -- with zero
+        // warning. Nextflow still reports overall success. Caught live: FILTER_SAMPLESHEET
+        // failed this way and silently skipped FILTER_LOW_EXPRESSION_SAMPLES,
+        // NORMALIZE_LOG_TPM, and DATA_VALIDATION entirely; run_MAPPED.sh would have gone on
+        // to register the incomplete run in the catalog with nothing to show for it.
+        // DATA_VALIDATION is the pipeline's true final stage (errorStrategy 'terminate',
+        // hard non-optional outputs), so its published tpm.csv is a reliable completion
+        // marker. Not gated on `workflow.success` -- referencing that property from inside
+        // this closure throws "NullPointerException: Cannot get property 'success' on null
+        // object" in this Nextflow version (confirmed via a live check: the `workflow`
+        // binding isn't reachable from onComplete's execution context either). Checking
+        // unconditionally is simpler and strictly safer anyway -- a genuinely successful
+        // run always has this file, so this only ever fires on a real problem.
+        // Skipped entirely if outdir was never set (capturedOutdir null) -- that failure
+        // mode is already a clear, direct error message on its own.
+        if ( capturedOutdir ) {
+            def finalOutput = file("${capturedOutdir}/expression_matrices/tpm.csv")
+            if ( ! finalOutput.exists() ) {
+                log.error "Pipeline did not produce the expected final output (${finalOutput}) -- a downstream stage was silently skipped, most likely because an errorStrategy 'ignore' process (FILTER_SAMPLESHEET, FEATURECOUNTS, or a MERGE_COUNTS* stage) genuinely failed without producing its optional output. Check the task logs for those processes before trusting this run."
+                System.exit(1)
+            }
+        }
     }
 
     // Make Python scripts in bin/ executable (moved here, not top-level script scope --
@@ -589,6 +580,7 @@ workflow {
     "chmod +x ${projectDir}/bin/normalize_log_tpm.py".execute().waitFor()
     "chmod +x ${projectDir}/bin/data_validation.py".execute().waitFor()
     "chmod +x ${projectDir}/bin/parse_qc.py".execute().waitFor()
+    "chmod +x ${projectDir}/bin/filter_samplesheet.py".execute().waitFor()
 
     if ( ! params.outdir )    error "Please provide --outdir"
 
