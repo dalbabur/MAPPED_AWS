@@ -133,7 +133,7 @@ workflow {
             .filter { meta -> !meta.fastq_1 }
             .map { meta -> meta.id }
             .collect()
-            .subscribe { ids -> if (ids) log.warn "No ENA FTP link available -- ${ids.size()} run(s) could not be downloaded from either source: ${ids.join(', ')}" }
+            .subscribe { failedIds -> if (failedIds) log.warn "No ENA FTP link available -- ${failedIds.size()} run(s) could not be downloaded from either source: ${failedIds.join(', ')}" }
 
         ch_awsodp_failed
             .filter { meta -> meta.fastq_1 }
