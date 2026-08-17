@@ -104,23 +104,51 @@ workflow {
             .set { ch_sra_reads }
 
         //
-        // MODULE: If FTP link is provided in run information then download FastQ directly via FTP and validate with md5sums
-        //
-        SRA_FASTQ_FTP (
-            ch_sra_reads.ftp
-        )
-        ch_versions = ch_versions.mix(SRA_FASTQ_FTP.out.versions.first())
-
-        //
         // MODULE: Otherwise (the default), fetch the run directly from NCBI SRA's AWS Open
         // Data buckets (s3://sra-pub-run-odp) and convert to FastQ with fasterq-dump. This
         // is the default download_method ('sratools'); set --download_method ftp to use
-        // SRA_FASTQ_FTP above instead.
+        // SRA_FASTQ_FTP for every sample instead.
         //
         SRA_FASTQ_AWSODP (
             ch_sra_reads.sratools
         )
         ch_versions = ch_versions.mix(SRA_FASTQ_AWSODP.out.versions.first())
+
+        // Any 'sratools' sample AWSODP produced no output for (5 retries exhausted, optional
+        // output empty) that also has an ENA FTP link in its metadata: retry once via
+        // SRA_FASTQ_FTP instead of silently dropping it. Standard Nextflow anti-join: pair
+        // the original per-sample input against AWSODP's output by meta.id; remainder:true
+        // surfaces samples with no match (fastq == null) on the AWSODP side.
+        ch_sra_reads.sratools
+            .map { meta, run_accession -> [ meta.id, meta ] }
+            .join(
+                SRA_FASTQ_AWSODP.out.fastq.map { meta, fastq -> [ meta.id, fastq ] },
+                remainder: true
+            )
+            .filter { id, meta, fastq -> fastq == null }
+            .map { id, meta, fastq -> meta }
+            .set { ch_awsodp_failed }
+
+        ch_awsodp_failed
+            .filter { meta -> !meta.fastq_1 }
+            .map { meta -> meta.id }
+            .collect()
+            .subscribe { ids -> if (ids) log.warn "No ENA FTP link available -- ${ids.size()} run(s) could not be downloaded from either source: ${ids.join(', ')}" }
+
+        ch_awsodp_failed
+            .filter { meta -> meta.fastq_1 }
+            .map { meta -> [ meta, meta.single_end ? [ meta.fastq_1 ] : [ meta.fastq_1, meta.fastq_2 ] ] }
+            .set { ch_sratools_fallback_ftp }
+
+        //
+        // MODULE: If FTP link is provided in run information then download FastQ directly via
+        // FTP and validate with md5sums. Also receives sratools/AWSODP failures with an ENA
+        // link (ch_sratools_fallback_ftp above) as an automatic fallback.
+        //
+        SRA_FASTQ_FTP (
+            ch_sra_reads.ftp.mix(ch_sratools_fallback_ftp)
+        )
+        ch_versions = ch_versions.mix(SRA_FASTQ_FTP.out.versions.first())
 
     //
     // MODULE: Stage FastQ files downloaded by SRA together and auto-create a samplesheet
