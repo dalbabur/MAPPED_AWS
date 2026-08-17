@@ -1157,7 +1157,11 @@ cat > mapped-runs-table.json <<'EOF'
       {"Name": "run_timestamp", "Type": "timestamp"},
       {"Name": "n_samples_downloaded", "Type": "int"},
       {"Name": "n_samples_passed_qc", "Type": "int"},
-      {"Name": "aws_batch_queue", "Type": "string"}
+      {"Name": "aws_batch_queue", "Type": "string"},
+      {"Name": "mean_mapping_rate_pct", "Type": "double"},
+      {"Name": "mean_assignment_rate_pct", "Type": "double"},
+      {"Name": "mean_rrna_fraction_pct", "Type": "double"},
+      {"Name": "mean_trna_fraction_pct", "Type": "double"}
     ],
     "Location": "s3://my-mapped-bucket/catalog/runs/",
     "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
@@ -1258,6 +1262,17 @@ annotation (e.g. a GenBank-only `GCA_` accession) or couldn't be resolved.
 `filter_processed_samples.py` (`--skip-processed`) matches on this in addition to
 `organism`/`ref_accession_used` when available, so a later re-annotation of the same
 assembly correctly triggers a re-run instead of being skipped as already processed.
+
+`mean_mapping_rate_pct`/`mean_assignment_rate_pct`/`mean_rrna_fraction_pct`/
+`mean_trna_fraction_pct` (`mapped_runs` only) summarize per-sample QC metrics computed by
+`COMPUTE_QC_METRICS` (`4_generate_count_matrix/bin/compute_qc_metrics.py`) from Bowtie2's
+alignment-rate summary and featureCounts' per-gene-biotype read breakdown, averaged across
+the run's samples. `mean_rrna_fraction_pct`/`mean_trna_fraction_pct` are the concrete
+number behind "this run's low mapping rate is un-depleted rRNA/tRNA, not a bad reference"
+— the fraction of gene-assigned reads that landed on an rRNA/tRNA gene rather than a
+protein-coding one. All four are `NULL` for `--quantifier salmon` runs (that path's
+protein-coding-only reference structurally can't see rRNA/tRNA reads, and never produces
+Bowtie2 logs to compute a mapping rate from either) and for any run predating this metric.
 
 ### 14.2 IAM — Glue and Athena access for the head node
 
@@ -1360,6 +1375,12 @@ SELECT organism, COUNT(DISTINCT run_id) AS n_runs, SUM(n_samples_passed_qc) AS t
 FROM mapped_catalog.mapped_runs
 GROUP BY organism
 ORDER BY n_runs DESC;
+
+-- Which runs are most affected by un-depleted rRNA/tRNA (bowtie2 runs only)
+SELECT run_id, organism, mean_mapping_rate_pct, mean_rrna_fraction_pct, mean_trna_fraction_pct
+FROM mapped_catalog.mapped_runs
+WHERE quantifier = 'bowtie2' AND mean_rrna_fraction_pct IS NOT NULL
+ORDER BY mean_rrna_fraction_pct DESC;
 ```
 
 **Out of scope**: this catalog answers "what exists and where," not "give me one combined

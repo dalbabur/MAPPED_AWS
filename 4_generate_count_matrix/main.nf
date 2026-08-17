@@ -214,6 +214,7 @@ process BOWTIE2_BUILD {
 process BOWTIE2_ALIGN {
     tag '$sample'
     container 'quay.io/biocontainers/bowtie2:2.5.5--ha27dd3b_0'
+    publishDir "${params.outdir}/bowtie2_logs", mode: 'copy', pattern: "*.bowtie2.log"
     cpus 2
     maxForks( (params.cpu as Integer).intdiv(4) )
     errorStrategy 'ignore'
@@ -224,12 +225,16 @@ process BOWTIE2_ALIGN {
 
     output:
       tuple val(sample), path("${sample}.sam"), val(reads instanceof List && reads.size() == 2), optional: true, emit: sam
+      // Bowtie2 always writes its alignment-rate summary to stderr, success or not --
+      // captured here instead of discarded, so COMPUTE_QC_METRICS can report mapping
+      // rate per run instead of it only ever existing in an ephemeral task log.
+      path "${sample}.bowtie2.log", optional: true, emit: bowtie2_log
 
     script:
     def is_paired = reads instanceof List && reads.size() == 2
     if (is_paired) {
         """
-        bowtie2 -x ${index}/index -1 ${reads[0]} -2 ${reads[1]} -p 2 -S ${sample}.sam || true
+        bowtie2 -x ${index}/index -1 ${reads[0]} -2 ${reads[1]} -p 2 -S ${sample}.sam 2> ${sample}.bowtie2.log || true
         if [ ! -s ${sample}.sam ]; then
             echo "BOWTIE2_ALIGN failed for sample ${sample}" >&2
         fi
@@ -237,7 +242,7 @@ process BOWTIE2_ALIGN {
     } else {
         def read_file = reads instanceof List ? reads[0] : reads
         """
-        bowtie2 -x ${index}/index -U ${read_file} -p 2 -S ${sample}.sam || true
+        bowtie2 -x ${index}/index -U ${read_file} -p 2 -S ${sample}.sam 2> ${sample}.bowtie2.log || true
         if [ ! -s ${sample}.sam ]; then
             echo "BOWTIE2_ALIGN failed for sample ${sample}" >&2
         fi
@@ -286,11 +291,43 @@ process FEATURECOUNTS {
 
     output:
       path "${sample}_counts.txt", optional: true, emit: counts
+      // featureCounts always writes this alongside its main output -- previously
+      // undeclared and so silently discarded. Has the Assigned/Unassigned_* read
+      // breakdown COMPUTE_QC_METRICS uses for the run's overall assignment rate.
+      path "${sample}_counts.txt.summary", optional: true, emit: summary
 
     script:
     def pairFlag = is_paired ? '-p --countReadPairs' : ''
     """
     featureCounts -a ${annotation} -F GTF -t gene -g locus_tag ${pairFlag} -T 2 -o ${sample}_counts.txt ${bam}
+    """
+}
+
+//
+// Process: compute run-wide mapping-rate / assignment-rate / rRNA-tRNA-fraction QC
+// metrics from Bowtie2's alignment summaries and featureCounts' per-gene-biotype
+// breakdown -- see bin/compute_qc_metrics.py's docstring. Bowtie2-quantifier path only:
+// the Salmon path's protein-coding-only reference structurally cannot see rRNA/tRNA
+// reads, so this metric is meaningless there.
+//
+process COMPUTE_QC_METRICS {
+    tag 'compute_qc_metrics'
+    container 'python:3.9-slim'
+    publishDir "${params.outdir}", mode: 'copy'
+    errorStrategy 'ignore'
+
+    input:
+      path bowtie2_logs
+      path fc_summaries
+      path counts_files
+      path annotation
+
+    output:
+      path 'qc_metrics.json', optional: true
+
+    script:
+    """
+    compute_qc_metrics.py --gff ${annotation}
     """
 }
 
@@ -581,6 +618,7 @@ workflow {
     "chmod +x ${projectDir}/bin/data_validation.py".execute().waitFor()
     "chmod +x ${projectDir}/bin/parse_qc.py".execute().waitFor()
     "chmod +x ${projectDir}/bin/filter_samplesheet.py".execute().waitFor()
+    "chmod +x ${projectDir}/bin/compute_qc_metrics.py".execute().waitFor()
 
     if ( ! params.outdir )    error "Please provide --outdir"
 
@@ -824,14 +862,29 @@ workflow {
             passed_ch
         )
     } else {
-        sam_ch = BOWTIE2_ALIGN(filtered_trimmed_ch, bowtie2_index_ch)
+        // Disambiguated via .sam/.bowtie2_log/.counts/.summary, not the old implicit
+        // single-output grab -- BOWTIE2_ALIGN and FEATURECOUNTS each gained a second
+        // named output (bowtie2_log, summary) for COMPUTE_QC_METRICS below, and Nextflow
+        // makes that ambiguous otherwise (same class of bug as SAM_SORT_INDEX's .bai
+        // output, fixed earlier -- see git history).
+        bowtie2_align_out = BOWTIE2_ALIGN(filtered_trimmed_ch, bowtie2_index_ch)
+        sam_ch = bowtie2_align_out.sam
+        bowtie2_log_success_ch = bowtie2_align_out.bowtie2_log.filter { it != null }
         sam_sort_index_out = SAM_SORT_INDEX(sam_ch)
         bam_ch = sam_sort_index_out.bam
-        fc_ch  = FEATURECOUNTS(bam_ch, refGff)
+        featurecounts_out = FEATURECOUNTS(bam_ch, refGff)
+        fc_ch = featurecounts_out.counts
+        fc_summary_success_ch = featurecounts_out.summary.filter { it != null }
         fc_success_ch = fc_ch.filter { counts_file -> counts_file != null }
         count_matrix_ch = MERGE_COUNTS_FEATURECOUNTS(
             fc_success_ch.collect(),
             passed_ch
+        )
+        COMPUTE_QC_METRICS(
+            bowtie2_log_success_ch.collect(),
+            fc_summary_success_ch.collect(),
+            fc_success_ch.collect(),
+            refGff
         )
     }
 

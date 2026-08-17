@@ -146,6 +146,23 @@ def resolve_annotation_version(outdir: str, ref_accession_used: str | None) -> s
     return None
 
 
+def resolve_qc_metrics(outdir: str) -> dict:
+    """Best-effort: run-wide mapping-rate/assignment-rate/rRNA-tRNA-fraction summary
+    from qc_metrics.json (4_generate_count_matrix/bin/compute_qc_metrics.py).
+
+    Only ever produced on the Bowtie2 quantifier path (see that script's docstring for
+    why); an empty dict here for a Salmon run or an older run predating this metric is
+    expected, not an error -- every value ends up null in the catalog row either way.
+    """
+    text = s3_cat(f"{outdir}/qc_metrics.json")
+    if not text:
+        return {}
+    try:
+        return json.loads(text).get("summary") or {}
+    except json.JSONDecodeError:
+        return {}
+
+
 def build_runs_row(
     args: argparse.Namespace,
     run_id: str,
@@ -153,6 +170,7 @@ def build_runs_row(
     samplesheet_df: pd.DataFrame | None,
     ref_accession_used: str | None,
     annotation_version: str | None,
+    qc_metrics: dict,
 ) -> pd.DataFrame:
     row = {
         "run_id": run_id,
@@ -172,6 +190,10 @@ def build_runs_row(
         "n_samples_downloaded": len(download_df) if download_df is not None else None,
         "n_samples_passed_qc": len(samplesheet_df) if samplesheet_df is not None else 0,
         "aws_batch_queue": args.aws_batch_queue,
+        "mean_mapping_rate_pct": qc_metrics.get("mean_mapping_rate_pct"),
+        "mean_assignment_rate_pct": qc_metrics.get("mean_assignment_rate_pct"),
+        "mean_rrna_fraction_pct": qc_metrics.get("mean_rrna_fraction_pct"),
+        "mean_trna_fraction_pct": qc_metrics.get("mean_trna_fraction_pct"),
     }
     df = pd.DataFrame([row])
     string_cols = [
@@ -183,6 +205,8 @@ def build_runs_row(
         df[col] = df[col].astype("string")
     for col in ["cpu", "n_samples_downloaded", "n_samples_passed_qc"]:
         df[col] = df[col].astype("Int64")
+    for col in ["mean_mapping_rate_pct", "mean_assignment_rate_pct", "mean_rrna_fraction_pct", "mean_trna_fraction_pct"]:
+        df[col] = df[col].astype("float64")
     df["run_timestamp"] = pd.to_datetime(df["run_timestamp"])
     return df
 
@@ -278,8 +302,9 @@ def main(argv=None) -> int:
     samplesheet_df = read_csv_from_s3(f"{outdir}/samplesheet/samplesheet.csv")
     ref_accession_used = resolve_ref_accession_used(outdir)
     annotation_version = resolve_annotation_version(outdir, ref_accession_used)
+    qc_metrics = resolve_qc_metrics(outdir)
 
-    runs_row = build_runs_row(args, run_id, download_df, samplesheet_df, ref_accession_used, annotation_version)
+    runs_row = build_runs_row(args, run_id, download_df, samplesheet_df, ref_accession_used, annotation_version, qc_metrics)
     samples_df = build_samples_df(samplesheet_df, run_id, args.organism, outdir, args.quantifier)
 
     wr.s3.to_parquet(
@@ -300,6 +325,8 @@ def main(argv=None) -> int:
             "library_layout": "string", "quantifier": "string", "cpu": "int",
             "run_timestamp": "timestamp", "n_samples_downloaded": "int",
             "n_samples_passed_qc": "int", "aws_batch_queue": "string",
+            "mean_mapping_rate_pct": "double", "mean_assignment_rate_pct": "double",
+            "mean_rrna_fraction_pct": "double", "mean_trna_fraction_pct": "double",
         },
     )
     n_passed = runs_row["n_samples_passed_qc"].iloc[0]
