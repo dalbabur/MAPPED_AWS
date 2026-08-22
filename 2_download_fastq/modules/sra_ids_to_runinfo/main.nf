@@ -3,7 +3,11 @@ process SRA_IDS_TO_RUNINFO {
     // out to one task per sample with no local throttle, all hitting ENA's metadata API
     // simultaneously at compendium scale (hundreds of samples), unlike the download
     // modules which have always capped this deliberately.
-    maxForks params.max_concurrent_downloads ?: 20
+    // Cast to Integer: a CLI-supplied --max_concurrent_downloads arrives as a String,
+    // unlike nextflow.config's own Integer default, and maxForks' internal Groovy
+    // comparisons choke on comparing a String to an int ("Cannot compare
+    // java.lang.String ... with java.lang.Integer") if not coerced here.
+    maxForks (params.max_concurrent_downloads as Integer) ?: 20
     tag "$id"
     label 'error_retry'
     errorStrategy 'ignore'
