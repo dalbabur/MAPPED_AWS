@@ -3,7 +3,7 @@ process SRA_FASTQ_FTP {
     // unlike nextflow.config's own Integer default, and maxForks' internal Groovy
     // comparisons choke on comparing a String to an int ("Cannot compare
     // java.lang.String ... with java.lang.Integer") if not coerced here.
-    maxForks (params.max_concurrent_downloads as Integer) ?: 20
+    maxForks( (params.max_concurrent_downloads as Integer) ?: 20 )
     maxRetries 5
     errorStrategy { task.attempt < 5 ? 'retry' : 'ignore' }
     tag "$meta.id"
