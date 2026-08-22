@@ -1,0 +1,11 @@
+{
+  "Pseudomonas putida": [
+    {
+      "alias": "UWC1",
+      "canonical_strain": "UWC1",
+      "min_genome_size": 1000000,
+      "ref_accession_override": "GCF_032681205.1",
+      "_comment": "UWC1 has no whole-genome assembly of its own at NCBI -- every 'Pseudomonas putida UWC1' hit is a small standalone plasmid deposit (largest 587kb, all flagged atypical/genome-length-too-small). UWC1 is a documented plasmid-cured derivative of P. putida mt-2; this pins mt-2's RefSeq assembly as an explicit, visible proxy genome rather than leaving these samples unresolved. Confirmed real: a study of 40 UWC1 runs was found deposited under KT2440's own tax_id (160488)."
+    }
+  ]
+}

@@ -14,6 +14,17 @@ params.cpu = params.cpu ?: 20
 //     SALMON_INDEX + SALMON_QUANT), kept as an opt-in.
 params.quantifier = params.quantifier ?: 'bowtie2'
 
+// Multi-strain support: when a by-strain sub-run (run_MAPPED.sh's off-strain loop) invokes
+// this workflow with --outdir pointed at a fresh nested directory, none of these three are
+// where that off-strain group's data actually lives -- reads_basedir points back at the
+// primary run's shared FASTQ location, samplesheet_override points at the strain-filtered
+// samplesheet subset, and exclude_ids_file (used only by the primary run itself) drops
+// off-strain sample ids so they aren't quantified against the wrong reference twice. All
+// three default to empty, which reproduces today's exact single-reference behavior.
+params.reads_basedir        = ''
+params.samplesheet_override = ''
+params.exclude_ids_file     = ''
+
 // Note: the --outdir requiredness check and the reference-genome/GFF auto-detection
 // that used to live here (as top-level `if`/`def` statements) now live at the top of
 // workflow{} below instead -- Nextflow (26.x+) rejects bare statements mixed with
@@ -658,8 +669,22 @@ workflow {
     // failing once the rest of this workflow's later operators are also present. An eager
     // check matches the pattern already used above for refDir/fastaFiles/gffFiles, which
     // never showed this problem.
-    def samplesheetDownloadFile = file("${params.outdir}/samplesheet/samplesheet_download.csv")
+    def samplesheetDownloadFile = params.samplesheet_override
+        ? file(params.samplesheet_override)
+        : file("${params.outdir}/samplesheet/samplesheet_download.csv")
     if ( ! samplesheetDownloadFile.exists() ) error "Sample sheet not found at: ${samplesheetDownloadFile}"
+
+    // Reads always physically live under the primary run's outdir -- a by-strain sub-run
+    // points --outdir at a fresh nested directory that never had FASTQs downloaded into it,
+    // so fastq_1/fastq_2 (paths relative to wherever they were downloaded, e.g.
+    // "seqFiles/fastq/<id>_1.fastq.gz") must resolve against reads_basedir instead when set.
+    def readsBaseDir = params.reads_basedir ?: params.outdir
+
+    // Off-strain samples (resolved to their own by-strain sub-run elsewhere) are excluded
+    // from the primary run here so they aren't also quantified against this reference.
+    def excludeIds = params.exclude_ids_file && file(params.exclude_ids_file).exists()
+        ? (file(params.exclude_ids_file).readLines()*.trim().findAll { it } as Set)
+        : ([] as Set)
 
     samples_ch = Channel
         .fromPath( samplesheetDownloadFile )
@@ -681,13 +706,13 @@ workflow {
         // MERGE_COUNTS/MERGE_COUNTS_FEATURECOUNTS's "No data to process" branch), so
         // nothing downstream actually depends on failing fast here.
         .filter { row ->
-            row.id && row.fastq_1 && row.run_accession
+            row.id && row.fastq_1 && row.run_accession && !excludeIds.contains(row.id)
         }
         // build the tuple for each sample using the id column which has SRX_SRR, DRX_DRR, or ERX_ERR format
         .map { row ->
-            def reads = [file("${params.outdir}/${row.fastq_1}")]
+            def reads = [file("${readsBaseDir}/${row.fastq_1}")]
             if (row.fastq_2 && row.fastq_2.trim()) {
-                reads.add(file("${params.outdir}/${row.fastq_2}"))
+                reads.add(file("${readsBaseDir}/${row.fastq_2}"))
             }
             tuple(row.id, reads)
         }
@@ -829,7 +854,7 @@ workflow {
     }
 
     // Filter original sample sheet based on passed samples
-    filtered_samplesheet_ch = FILTER_SAMPLESHEET( file("${params.outdir}/samplesheet/samplesheet_download.csv"), passed_ch )
+    filtered_samplesheet_ch = FILTER_SAMPLESHEET( samplesheetDownloadFile, passed_ch )
 
     // Create a channel of passed sample IDs
     passed_samples_ch = passed_ch
@@ -907,6 +932,6 @@ workflow {
         filtered_results.log_tpm,
         filtered_results.counts,
         log_tpm_norm_ch,
-        file("${params.outdir}/samplesheet/samplesheet_download.csv")
+        samplesheetDownloadFile
     )
 }

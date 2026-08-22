@@ -305,12 +305,17 @@ fi
 # changes nothing about its own correctness, but it does let us resolve the actual
 # reference genome accession *before* deciding what to skip.
 run_step3_reference_genome() {
-  echo "=== Step 3: Download reference genome ==="
+  # Optional overrides let the off-strain loop below reuse this same function against a
+  # nested by-strain outdir/accession without touching either existing call site (both
+  # keep calling it with zero args, seeing zero behavior change).
+  local step3_outdir="${1:-$OUTDIR}"
+  local step3_ref_accession="${2:-$REF_ACCESSION}"
+  echo "=== Step 3: Download reference genome ($step3_outdir) ==="
   pushd 3_download_reference_genome > /dev/null 2>&1
-  if [[ -n "$REF_ACCESSION" ]]; then
-    nextflow run main.nf ${NF_PROFILE_FLAG} -work-dir "$WORKDIR" --ref_accession "$REF_ACCESSION" --outdir "$OUTDIR" ${CPU:+--cpu $CPU} ${AWS_BATCH_QUEUE:+--aws_batch_queue "$AWS_BATCH_QUEUE"} ${AWS_BATCH_JOB_ROLE_ARN:+--aws_batch_job_role_arn "$AWS_BATCH_JOB_ROLE_ARN"} -resume
+  if [[ -n "$step3_ref_accession" ]]; then
+    nextflow run main.nf ${NF_PROFILE_FLAG} -work-dir "$WORKDIR" --ref_accession "$step3_ref_accession" --outdir "$step3_outdir" ${CPU:+--cpu $CPU} ${AWS_BATCH_QUEUE:+--aws_batch_queue "$AWS_BATCH_QUEUE"} ${AWS_BATCH_JOB_ROLE_ARN:+--aws_batch_job_role_arn "$AWS_BATCH_JOB_ROLE_ARN"} -resume
   else
-    nextflow run main.nf ${NF_PROFILE_FLAG} -work-dir "$WORKDIR" --organism "$ORGANISM" --outdir "$OUTDIR" ${CPU:+--cpu $CPU} ${AWS_BATCH_QUEUE:+--aws_batch_queue "$AWS_BATCH_QUEUE"} ${AWS_BATCH_JOB_ROLE_ARN:+--aws_batch_job_role_arn "$AWS_BATCH_JOB_ROLE_ARN"} -resume
+    nextflow run main.nf ${NF_PROFILE_FLAG} -work-dir "$WORKDIR" --organism "$ORGANISM" --outdir "$step3_outdir" ${CPU:+--cpu $CPU} ${AWS_BATCH_QUEUE:+--aws_batch_queue "$AWS_BATCH_QUEUE"} ${AWS_BATCH_JOB_ROLE_ARN:+--aws_batch_job_role_arn "$AWS_BATCH_JOB_ROLE_ARN"} -resume
   fi
   popd > /dev/null 2>&1
 }
@@ -379,6 +384,22 @@ pushd 2_download_fastq > /dev/null 2>&1
 nextflow run main.nf ${NF_PROFILE_FLAG} -work-dir "$WORKDIR" --outdir "$OUTDIR" ${MAX_CONCURRENT_DOWNLOADS:+--max_concurrent_downloads $MAX_CONCURRENT_DOWNLOADS} ${AWS_BATCH_QUEUE:+--aws_batch_queue "$AWS_BATCH_QUEUE"} ${AWS_BATCH_JOB_ROLE_ARN:+--aws_batch_job_role_arn "$AWS_BATCH_JOB_ROLE_ARN"} -resume
 popd > /dev/null 2>&1
 
+# Detect samples whose true strain doesn't match what was queried (e.g. mislabeled at
+# submission time under the queried strain's own tax_id -- see
+# 2_download_fastq/bin/detect_strain_groups.py's docstring for the real case that
+# motivated this). Off-strain samples get routed to their own by-strain Step 3/4 pass
+# below against their correct reference, instead of being silently forced through this
+# run's reference or silently dropped.
+echo "=== Detecting off-strain samples ==="
+if STRAIN_DETECTION_OUTPUT=$(python3 2_download_fastq/bin/detect_strain_groups.py --outdir "$OUTDIR" --organism "$ORGANISM" ${STRAIN:+--strain "$STRAIN"}); then
+  echo "$STRAIN_DETECTION_OUTPUT"
+else
+  echo "$STRAIN_DETECTION_OUTPUT"
+  echo "WARNING: strain detection failed (non-fatal) -- proceeding as if no off-strain samples were found."
+  STRAIN_DETECTION_OUTPUT=""
+fi
+echo "============================="
+
 # Step 3: Download reference genome (already done above if --skip-processed)
 if [[ "$STAGE3_DONE" != "true" ]]; then
   run_step3_reference_genome
@@ -387,8 +408,31 @@ fi
 # Step 4: Generate count/tpm matrix
 echo "=== Step 4: Generate count/tpm matrix ==="
 pushd 4_generate_count_matrix > /dev/null 2>&1
-nextflow run main.nf ${NF_PROFILE_FLAG} -work-dir "$WORKDIR" --outdir "$OUTDIR" ${CPU:+--cpu $CPU} ${QUANTIFIER:+--quantifier "$QUANTIFIER"} ${AWS_BATCH_QUEUE:+--aws_batch_queue "$AWS_BATCH_QUEUE"} ${AWS_BATCH_JOB_ROLE_ARN:+--aws_batch_job_role_arn "$AWS_BATCH_JOB_ROLE_ARN"} -resume
+nextflow run main.nf ${NF_PROFILE_FLAG} -work-dir "$WORKDIR" --outdir "$OUTDIR" ${CPU:+--cpu $CPU} ${QUANTIFIER:+--quantifier "$QUANTIFIER"} --exclude_ids_file "$OUTDIR/metadata/exclude_ids_primary.txt" ${AWS_BATCH_QUEUE:+--aws_batch_queue "$AWS_BATCH_QUEUE"} ${AWS_BATCH_JOB_ROLE_ARN:+--aws_batch_job_role_arn "$AWS_BATCH_JOB_ROLE_ARN"} -resume
 popd > /dev/null 2>&1
+
+# Off-strain groups: each gets its own nested outdir, its own Step 3 (correct reference
+# genome) and Step 4 (reads_basedir points back at the primary run's shared FASTQ
+# location, since off-strain groups never had their own FASTQ downloaded). Kept fully
+# separate from the primary run's expression_matrices -- different strains don't share a
+# gene-ID coordinate system, so these were never mergeable into one matrix anyway.
+BY_STRAIN_OUTDIRS=()
+if [[ -n "$STRAIN_DETECTION_OUTPUT" ]]; then
+  while IFS='|' read -r strain ref_accession method override_csv; do
+    [[ -z "$strain" ]] && continue
+    strain_outdir="$OUTDIR/by-strain/$strain"
+    echo "=== Off-strain group: $strain ($ref_accession, $method) ==="
+    run_step3_reference_genome "$strain_outdir" "$ref_accession"
+
+    echo "=== Step 4 for $strain ==="
+    pushd 4_generate_count_matrix > /dev/null 2>&1
+    nextflow run main.nf ${NF_PROFILE_FLAG} -work-dir "$WORKDIR" --outdir "$strain_outdir" --reads_basedir "$OUTDIR" --samplesheet_override "$override_csv" ${CPU:+--cpu $CPU} ${QUANTIFIER:+--quantifier "$QUANTIFIER"} ${AWS_BATCH_QUEUE:+--aws_batch_queue "$AWS_BATCH_QUEUE"} ${AWS_BATCH_JOB_ROLE_ARN:+--aws_batch_job_role_arn "$AWS_BATCH_JOB_ROLE_ARN"} -resume
+    popd > /dev/null 2>&1
+
+    BY_STRAIN_OUTDIRS+=("$strain_outdir|$strain|$ref_accession")
+    echo "============================="
+  done < <(printf '%s\n' "$STRAIN_DETECTION_OUTPUT" | grep '^STRAIN_GROUP=' | cut -d= -f2-)
+fi
 
 # Print sample counts after Step 4
 echo "=== Sample Count Summary ==="
@@ -426,27 +470,43 @@ else
 fi
 echo "============================="
 
-# Step 5: Register this run in the Glue Data Catalog (S3 mode only -- see AWS_SETUP.md §14)
+# Step 5/6: Register this run (and every off-strain by-strain sub-run) in the Glue Data
+# Catalog and S3 Lifecycle rules (S3 mode only -- see AWS_SETUP.md §14). Each by-strain
+# outdir gets its own run_id for free (derive_run_id() in register_run.py derives it from
+# the full outdir string, and run_name_from_prefix() in register_run_lifecycle.py already
+# round-trips a nested "results-foo/by-strain/UWC1" prefix correctly) -- no catalog schema
+# changes needed. This is what turns per-run strain detection into a growing multi-strain
+# database, one cataloged run per detected strain.
 if [[ "$OUTDIR" == s3://* ]]; then
-  echo "=== Step 5: Register run in catalog ==="
-  python3 catalog/register_run.py \
-    --outdir "$OUTDIR" --workdir "$WORKDIR" --organism "$ORGANISM" \
-    --library-layout "$LIB_LAYOUT" \
-    ${STRAIN:+--strain "$STRAIN"} ${BIOPROJECT:+--bioproject "$BIOPROJECT"} \
-    ${SRA_ACCESSIONS:+--sra-accessions "$SRA_ACCESSIONS"} \
-    ${REF_ACCESSION:+--ref-accession "$REF_ACCESSION"} \
-    --quantifier "$QUANTIFIER" \
-    ${CPU:+--cpu "$CPU"} ${AWS_BATCH_QUEUE:+--aws-batch-queue "$AWS_BATCH_QUEUE"} \
-    || echo "WARNING: catalog registration failed (non-fatal) -- pipeline outputs in S3 are unaffected. Re-run 'python3 catalog/register_run.py --outdir $OUTDIR ...' manually to retry."
-  echo "============================="
+  register_one_run() {
+    local reg_outdir="$1" reg_strain="$2" reg_ref_accession="$3"
+    echo "=== Step 5: Register run in catalog ($reg_outdir) ==="
+    python3 catalog/register_run.py \
+      --outdir "$reg_outdir" --workdir "$WORKDIR" --organism "$ORGANISM" \
+      --library-layout "$LIB_LAYOUT" \
+      ${reg_strain:+--strain "$reg_strain"} ${BIOPROJECT:+--bioproject "$BIOPROJECT"} \
+      ${SRA_ACCESSIONS:+--sra-accessions "$SRA_ACCESSIONS"} \
+      ${reg_ref_accession:+--ref-accession "$reg_ref_accession"} \
+      --quantifier "$QUANTIFIER" \
+      ${CPU:+--cpu "$CPU"} ${AWS_BATCH_QUEUE:+--aws-batch-queue "$AWS_BATCH_QUEUE"} \
+      || echo "WARNING: catalog registration failed (non-fatal) -- pipeline outputs in S3 are unaffected. Re-run 'python3 catalog/register_run.py --outdir $reg_outdir ...' manually to retry."
+    echo "============================="
 
-  # Step 6: Register this run's S3 Lifecycle rules (disposable intermediates expire,
-  # BAMs archive to Glacier) -- see catalog/register_run_lifecycle.py for the retention
-  # rationale. S3 mode only, same as Step 5.
-  echo "=== Step 6: Register S3 lifecycle rules ==="
-  python3 catalog/register_run_lifecycle.py --outdir "$OUTDIR" \
-    || echo "WARNING: lifecycle rule registration failed (non-fatal) -- pipeline outputs in S3 are unaffected, but this run's disposable intermediates won't auto-expire until 'python3 catalog/register_run_lifecycle.py --outdir $OUTDIR' is re-run manually."
-  echo "============================="
+    # Register this run's S3 Lifecycle rules (disposable intermediates expire, BAMs
+    # archive to Glacier) -- see catalog/register_run_lifecycle.py for the retention
+    # rationale.
+    echo "=== Step 6: Register S3 lifecycle rules ($reg_outdir) ==="
+    python3 catalog/register_run_lifecycle.py --outdir "$reg_outdir" \
+      || echo "WARNING: lifecycle rule registration failed (non-fatal) -- pipeline outputs in S3 are unaffected, but this run's disposable intermediates won't auto-expire until 'python3 catalog/register_run_lifecycle.py --outdir $reg_outdir' is re-run manually."
+    echo "============================="
+  }
+
+  register_one_run "$OUTDIR" "$STRAIN" "$REF_ACCESSION"
+  for entry in "${BY_STRAIN_OUTDIRS[@]:-}"; do
+    [[ -z "$entry" ]] && continue
+    IFS='|' read -r reg_outdir reg_strain reg_ref_accession <<< "$entry"
+    register_one_run "$reg_outdir" "$reg_strain" "$reg_ref_accession"
+  done
 fi
 
 echo "All steps completed successfully!"
@@ -460,11 +520,13 @@ if [[ "$CLEAN_MODE" == "true" ]]; then
     mv "$OUTDIR/seqFiles/ref_genome" "$OUTDIR/ref_genome_temp"
   fi
   
-  # Delete everything in OUTDIR except expression_matrices, samplesheet, and the
-  # collision-guard manifest (which describes what's in the two directories being
-  # kept -- deleting it here would make a future run against this same outdir think
-  # it's untouched, defeating the guard)
-  find "$OUTDIR" -mindepth 1 -maxdepth 1 ! -name expression_matrices ! -name samplesheet ! -name ref_genome_temp ! -name .mapped_run_manifest -exec rm -rf {} +
+  # Delete everything in OUTDIR except expression_matrices, samplesheet, by-strain (each
+  # off-strain group's own expression_matrices/samplesheet, in its own nested outdir --
+  # never contains raw FASTQs of its own, since by-strain Step 4 runs read those via
+  # --reads_basedir from the primary outdir instead), and the collision-guard manifest
+  # (which describes what's in the directories being kept -- deleting it here would make
+  # a future run against this same outdir think it's untouched, defeating the guard)
+  find "$OUTDIR" -mindepth 1 -maxdepth 1 ! -name expression_matrices ! -name samplesheet ! -name by-strain ! -name ref_genome_temp ! -name .mapped_run_manifest -exec rm -rf {} +
   
   # Move ref_genome back to the same level as expression_matrices and samplesheet
   if [[ -d "$OUTDIR/ref_genome_temp" ]]; then
