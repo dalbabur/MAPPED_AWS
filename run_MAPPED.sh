@@ -439,6 +439,14 @@ if [[ "$OUTDIR" == s3://* ]]; then
     ${CPU:+--cpu "$CPU"} ${AWS_BATCH_QUEUE:+--aws-batch-queue "$AWS_BATCH_QUEUE"} \
     || echo "WARNING: catalog registration failed (non-fatal) -- pipeline outputs in S3 are unaffected. Re-run 'python3 catalog/register_run.py --outdir $OUTDIR ...' manually to retry."
   echo "============================="
+
+  # Step 6: Register this run's S3 Lifecycle rules (disposable intermediates expire,
+  # BAMs archive to Glacier) -- see catalog/register_run_lifecycle.py for the retention
+  # rationale. S3 mode only, same as Step 5.
+  echo "=== Step 6: Register S3 lifecycle rules ==="
+  python3 catalog/register_run_lifecycle.py --outdir "$OUTDIR" \
+    || echo "WARNING: lifecycle rule registration failed (non-fatal) -- pipeline outputs in S3 are unaffected, but this run's disposable intermediates won't auto-expire until 'python3 catalog/register_run_lifecycle.py --outdir $OUTDIR' is re-run manually."
+  echo "============================="
 fi
 
 echo "All steps completed successfully!"

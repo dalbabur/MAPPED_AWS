@@ -446,38 +446,51 @@ s3://my-mapped-bucket/catalog/   <- run/sample discovery index, see §14
 
 `--clean-mode` does local `mv`/`rm -rf` surgery that has no direct S3 equivalent (see
 `run_MAPPED.sh`, which now refuses `--clean-mode` combined with `s3://` paths). Use S3
-Lifecycle rules instead — safer (no risk of deleting the wrong prefix) and async:
+Lifecycle rules instead — safer (no risk of deleting the wrong prefix) and async.
 
-```bash
-cat > lifecycle.json <<'EOF'
-{
-  "Rules": [
-    { "ID": "expire-nextflow-work", "Filter": {"Prefix": "work/"}, "Status": "Enabled",
-      "Expiration": {"Days": 14} },
-    { "ID": "expire-raw-fastq", "Filter": {"Prefix": "results/seqFiles/fastq/"}, "Status": "Enabled",
-      "Expiration": {"Days": 30} },
-    { "ID": "expire-fastqc", "Filter": {"Prefix": "results/fastqc/"}, "Status": "Enabled",
-      "Expiration": {"Days": 30} },
-    { "ID": "expire-trimmed", "Filter": {"Prefix": "results/trimmed/"}, "Status": "Enabled",
-      "Expiration": {"Days": 30} },
-    { "ID": "expire-salmon", "Filter": {"Prefix": "results/salmon/"}, "Status": "Enabled",
-      "Expiration": {"Days": 30} },
-    { "ID": "expire-multiqc", "Filter": {"Prefix": "results/multiqc/"}, "Status": "Enabled",
-      "Expiration": {"Days": 30} }
-  ]
-}
-EOF
-aws s3api put-bucket-lifecycle-configuration \
-  --bucket my-mapped-bucket --lifecycle-configuration file://lifecycle.json
-```
+**`--outdir`/`--workdir` bake the run name directly into the top-level prefix** (e.g.
+`results-full-kt2440/`, `work-full-kt2440/`) — there is no shared `results/`/`work/` root
+with the run name nested underneath it. This matters because S3 Lifecycle rules only
+match by key *prefix*: a rule can cover every run's work-dir with one static rule (they
+all genuinely share the literal `work-` prefix), but it can *not* cover "every run's
+`trimmed/` folder" with one rule, since each run's `results-<name>/trimmed/` differs in
+the run-name segment and S3 prefix matching has no wildcard for that. An earlier version
+of this doc showed a single static example (`work/`, `results/seqFiles/fastq/`, etc.)
+that assumed the nested layout — since actual runs never use that layout, those rules
+matched zero objects and silently did nothing for as long as they existed.
 
-All five expiring prefixes (`fastqc`, `trimmed`, `salmon`, `multiqc`, plus the raw
-`seqFiles/fastq`) are re-derivable by re-running the pipeline, matching exactly what
-local `--clean-mode` used to delete. Leave `results/expression_matrices/` and
-`results/samplesheet/` (the equivalent of what
-local `--clean-mode` preserves) with no expiration rule. `catalog/` (§14) is likewise
-left with no expiration rule — it's small (metadata rows, not raw data) and is the whole
+The fix now in place: `run_MAPPED.sh`'s Step 6 (S3 mode only, right after the Step 5
+catalog registration) calls `catalog/register_run_lifecycle.py --outdir "$OUTDIR"` at the
+end of every run, which registers that run's own rules — idempotent, so re-running a
+pipeline against the same `--outdir` is a no-op the second time. It maintains:
+
+- **`expire-work-dirs`** (added once, covers every run present and future via the shared
+  `work-` prefix): deletes anything under any `work-*/` after 14 days. This is Nextflow's
+  own task-staging area — raw/trimmed FASTQ, uncompressed SAM, sorted BAM, and per-task
+  scratch all mixed together with no way to distinguish file types by prefix within it
+  (Nextflow buckets by task hash, not file type). 14 days is enough runway to `-resume` a
+  stalled run; past that, everything in it is either already published under
+  `results-<name>/` or fully reproducible by re-running from source.
+- **Per-run, added by Step 6**: `results-<name>/seqFiles/fastq/`, `results-<name>/trimmed/`,
+  and `results-<name>/salmon/` expire after 14 days — the raw FASTQ this pipeline
+  downloads is already durably hosted by SRA/ENA's own public archives for free, so a
+  redundant local copy has little long-term value, and trimmed FASTQ/Salmon quant output
+  are both cheap to regenerate.
+- **Per-run, added by Step 6**: `results-<name>/bowtie2/` (the sorted BAM + `.bai` from
+  `SAM_SORT_INDEX`) transitions to **Glacier** after 30 days instead of expiring. Unlike
+  the others, a BAM represents real alignment work (not just requantification) that's
+  genuinely expensive to redo — worth cheap long-term storage for future reuse
+  (re-quantify differently, IGV, variant calling) even though it's rarely accessed.
+
+Left with no expiration rule entirely: `results-<name>/expression_matrices/` and
+`results-<name>/samplesheet/` (the actual deliverables — the equivalent of what local
+`--clean-mode` preserves), plus the small QC/log artifacts (`fastqc/`, `multiqc/`,
+`bowtie2_logs/`, `metadata/`) that are cheap to keep and useful for provenance. `catalog/`
+(§14) is likewise left alone — it's small (metadata rows, not raw data) and is the whole
 point of §14, not a disposable intermediate.
+
+To retrofit this onto an `--outdir` that already exists from before Step 6 existed, just
+run it directly: `python3 catalog/register_run_lifecycle.py --outdir s3://my-mapped-bucket/results-<name>`.
 
 ---
 
