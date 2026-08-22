@@ -80,7 +80,41 @@ workflow {
 
     if (!params.skip_fastq_download) {
 
+        // Skip AWSODP/FTP entirely for samples already sitting in the publishDir from a
+        // prior run/resume. Nextflow only caches *successful* task executions -- a sample
+        // that failed on AWSODP but was recovered via the FTP fallback below has no cache
+        // entry for the AWSODP attempt itself (it never succeeded), so a fresh or resumed
+        // session re-attempts AWSODP from scratch for it every time, even though the
+        // actual FASTQ data is already downloaded and sitting right here. Both download
+        // modules publish to the same "${params.outdir}/seqFiles/fastq" location with the
+        // same ${meta.id}[_1/_2].fastq.gz naming regardless of which one produced it, so a
+        // simple existence check here recognizes success via *either* path, not just
+        // whichever one Nextflow's own cache happens to remember.
         ch_sra_metadata
+            .map { meta ->
+                def base = "${params.outdir}/seqFiles/fastq"
+                def already_downloaded = meta.single_end
+                    ? file("${base}/${meta.id}.fastq.gz").exists()
+                    : (file("${base}/${meta.id}_1.fastq.gz").exists() && file("${base}/${meta.id}_2.fastq.gz").exists())
+                [ meta, already_downloaded ]
+            }
+            .branch {
+                meta, already_downloaded ->
+                    skip: already_downloaded
+                        return meta.id
+                    download: !already_downloaded
+                        return meta
+            }
+            .set { ch_sra_download_check }
+
+        ch_sra_download_check.skip
+            .collect()
+            .subscribe { skippedIds -> if (skippedIds) log.info "Skipping download for ${skippedIds.size()} sample(s) already present in ${params.outdir}/seqFiles/fastq: ${skippedIds.join(', ')}" }
+
+        ch_sra_download_check.download
+            .set { ch_sra_metadata_to_download }
+
+        ch_sra_metadata_to_download
             .branch {
                 meta ->
                     def download_method = 'ftp'
